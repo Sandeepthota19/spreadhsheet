@@ -1,9 +1,6 @@
 // Loads a fixture TSV into the engine starting at A1.
-// Deliberately minimal: one setCell per cell, no styling, no type coercion.
-// You may replace this with your own import path. That is fine as long as
-// both "Load" buttons keep working.
+// The whole load is one engine transaction, so one undo removes it.
 import salesSmall from '../../fixtures/sales.tsv?raw'
-import salesLarge from '../../fixtures/sales-large.tsv?raw'
 
 export function parseTsv(text) {
     const lines = text.replace(/\r\n?/g, '\n').split('\n')
@@ -11,24 +8,24 @@ export function parseTsv(text) {
     return lines.map(line => line.split('\t'))
 }
 
-function loadTsv(engine, text) {
+function loadTsv(engine, text, label) {
     const rows = parseTsv(text)
     const cols = Math.max(...rows.map(r => r.length))
     engine.ensureCapacity(rows.length + 20, cols + 5)
-    for (let r = 0; r < rows.length; r++) {
-        for (let c = 0; c < rows[r].length; c++) {
-            engine.setCell(r, c, rows[r][c])
-        }
-    }
+    engine.setCells(0, 0, rows, label)
     return { rows: rows.length, cols }
 }
 
 /** 33 lines: header, 31 messy data rows, totals row. */
 export function loadSampleSmall(engine) {
-    return loadTsv(engine, salesSmall)
+    return loadTsv(engine, salesSmall, 'Load sales.tsv')
 }
 
-/** ~3,000 lines of the same kind of data. */
-export function loadSampleLarge(engine) {
-    return loadTsv(engine, salesLarge)
+/**
+ * ~3,000 lines of the same kind of data. Loaded on demand so the large
+ * file is not part of the bundle that has to parse before first paint.
+ */
+export async function loadSampleLarge(engine) {
+    const { default: salesLarge } = await import('../../fixtures/sales-large.tsv?raw')
+    return loadTsv(engine, salesLarge, 'Load sales-large.tsv')
 }
