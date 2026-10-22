@@ -4,21 +4,22 @@
 // scrolling repaints imperatively without a React render.
 import { useEffect, useImperativeHandle, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { createAxisLayout } from '../grid/axisLayout.js'
-import { createViewport, ROW_HEADER_WIDTH, COL_HEADER_HEIGHT } from '../grid/geometry.js'
+import { createViewport, ROW_HEADER_WIDTH, COL_HEADER_HEIGHT, FILTER_BUTTON } from '../grid/geometry.js'
 import { drawGrid } from '../grid/draw.js'
 import { makeSelection, fillTarget } from './selection.js'
 import { perf } from './perf.js'
 
 export function Grid({ engine, version, selection, onSelect, editing, editorRef, onEditorKeyDown, onEditorInput,
-    onStartEdit, gridRef }) {
+    onStartEdit, filterButtons, onOpenFilter, onSort, gridRef }) {
     const containerRef = useRef(null)
     const canvasRef = useRef(null)
     const [size, setSize] = useState({ width: 800, height: 500 })
     const modeRef = useRef(null)
+    const hoverRef = useRef({ col: -1 })
     const frameRef = useRef(0)
 
     const rowLayout = useMemo(
-        () => createAxisLayout(engine.rows, r => engine.getRowHeight(r)),
+        () => createAxisLayout(engine.rows, r => (engine.isRowHidden(r) ? 0 : engine.getRowHeight(r))),
         // version changes on every engine transaction (sizes, filters, structure)
         // eslint-disable-next-line react-hooks/exhaustive-deps
         [engine, version],
@@ -33,7 +34,7 @@ export function Grid({ engine, version, selection, onSelect, editing, editorRef,
     // scroll path always sees current props.
     const stateRef = useRef(null)
     useLayoutEffect(() => {
-        stateRef.current = { engine, selection, editing, rowLayout, colLayout, size }
+        stateRef.current = { engine, selection, editing, filterButtons, rowLayout, colLayout, size }
     })
 
     function viewport() {
@@ -69,6 +70,9 @@ export function Grid({ engine, version, selection, onSelect, editing, editorRef,
             selection: s.selection,
             editing: s.editing,
             fillPreview: mode?.type === 'fill' ? mode.target : null,
+            filterButtons: s.filterButtons,
+            sortState: s.engine.getSortState(),
+            hoverCol: hoverRef.current.col,
         })
         positionEditor(vp)
         perf.recordFrame(performance.now() - t0)
@@ -168,6 +172,14 @@ export function Grid({ engine, version, selection, onSelect, editing, editorRef,
         switch (hit.area) {
             case 'cell': {
                 const { r, c } = hit
+                if (s.filterButtons && r === 0 && c <= s.filterButtons.lastCol) {
+                    const right = vp.colX(c) + s.colLayout.sizeOf(c)
+                    if (x >= right - FILTER_BUTTON - 3) {
+                        const canvasRect = canvasRef.current.getBoundingClientRect()
+                        onOpenFilter(c, { left: canvasRect.left + right - 240, top: canvasRect.top + vp.rowY(0) + s.rowLayout.sizeOf(0) })
+                        return
+                    }
+                }
                 if (e.detail >= 2) { onStartEdit(r, c, null); return }
                 const next = e.shiftKey && sel ? makeSelection(sel.anchor, { r, c }) : makeSelection({ r, c })
                 onSelect(next)
@@ -190,6 +202,9 @@ export function Grid({ engine, version, selection, onSelect, editing, editorRef,
             }
             case 'corner':
                 onSelect(makeSelection({ r: 0, c: 0 }, { r: s.rowLayout.count - 1, c: s.colLayout.count - 1 }, 'all'))
+                return
+            case 'sort':
+                onSort(hit.c)
                 return
         }
         canvasRef.current.setPointerCapture(e.pointerId)
@@ -243,12 +258,19 @@ export function Grid({ engine, version, selection, onSelect, editing, editorRef,
         const vp = viewport()
         const canvas = canvasRef.current
         let cursor = 'cell'
+        let hoverCol = -1
         if (onFillHandle(vp, x, y)) cursor = 'crosshair'
         else {
             const hit = vp.hitTest(x, y)
-            if (hit.area === 'colHeader' || hit.area === 'rowHeader' || hit.area === 'corner') cursor = 'default'
+            if (hit.area === 'sort') { cursor = 'pointer'; hoverCol = hit.c }
+            else if (hit.area === 'colHeader') { cursor = 'default'; hoverCol = hit.c }
+            else if (hit.area === 'rowHeader' || hit.area === 'corner') cursor = 'default'
         }
         canvas.style.cursor = cursor
+        if (hoverRef.current.col !== hoverCol) {
+            hoverRef.current.col = hoverCol
+            schedulePaint()
+        }
     }
 
     function onPointerUp() {

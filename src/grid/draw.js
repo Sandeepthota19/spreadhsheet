@@ -6,7 +6,7 @@
 // ─────────────────────────────────────────────────────────────
 
 import { columnLabel } from '../engine/address.js'
-import { ROW_HEADER_WIDTH, COL_HEADER_HEIGHT } from './geometry.js'
+import { ROW_HEADER_WIDTH, COL_HEADER_HEIGHT, FILTER_BUTTON } from './geometry.js'
 
 export const FONT_FAMILY = 'system-ui, -apple-system, "Segoe UI", Roboto, sans-serif'
 
@@ -93,7 +93,8 @@ function drawCells(ctx, s, rows, cols) {
             const w = colLayout.sizeOf(c)
             const font = fontFor(style)
             const tw = textWidth(ctx, font, text)
-            const inner = w - PADDING * 2
+            const reserve = s.filterButtons && r === 0 && c <= s.filterButtons.lastCol ? FILTER_BUTTON + 2 : 0
+            const inner = w - PADDING * 2 - reserve
             const isError = /^#(REF!|VALUE!|DIV\/0!|NAME\?|PARSE!|CYCLE!)$/.test(text)
             ctx.font = font
             ctx.fillStyle = isError ? COLORS.error : style.color
@@ -104,7 +105,7 @@ function drawCells(ctx, s, rows, cols) {
             if (clip) {
                 ctx.save()
                 ctx.beginPath()
-                ctx.rect(x + 1, y, w - 2, h)
+                ctx.rect(x + 1, y, w - 2 - reserve, h)
                 ctx.clip()
                 if (style.align !== 'left') tx = x + PADDING
             }
@@ -113,6 +114,27 @@ function drawCells(ctx, s, rows, cols) {
                 ctx.fillRect(tx, y + h / 2 + style.fontSize / 2, Math.min(tw, inner), 1)
             }
             if (clip) ctx.restore()
+        }
+    }
+    // filter buttons on the header row
+    if (s.filterButtons && rows.first === 0) {
+        for (let c = cols.first; c <= Math.min(cols.last, s.filterButtons.lastCol); c++) {
+            const x = vp.colX(c) + colLayout.sizeOf(c) - FILTER_BUTTON - 2
+            const y = vp.rowY(0) + (rowLayout.sizeOf(0) - FILTER_BUTTON) / 2
+            const active = s.filterButtons.active.has(c)
+            ctx.fillStyle = active ? COLORS.filter : '#ffffff'
+            ctx.strokeStyle = active ? COLORS.filter : '#9aa0a6'
+            ctx.beginPath()
+            ctx.rect(x + 0.5, y + 0.5, FILTER_BUTTON - 1, FILTER_BUTTON - 1)
+            ctx.fill()
+            ctx.stroke()
+            ctx.fillStyle = active ? '#ffffff' : '#5f6368'
+            ctx.beginPath()
+            ctx.moveTo(x + 4, y + 6)
+            ctx.lineTo(x + FILTER_BUTTON - 4, y + 6)
+            ctx.lineTo(x + FILTER_BUTTON / 2, y + 11)
+            ctx.closePath()
+            ctx.fill()
         }
     }
 }
@@ -195,6 +217,11 @@ function drawHeaders(ctx, s) {
             ctx.fillStyle = selected ? COLORS.headerSelectedText : COLORS.headerText
             const label = columnLabel(c)
             ctx.fillText(label, x + (w - ctx.measureText(label).width) / 2, COL_HEADER_HEIGHT / 2 + 1)
+            const sorted = s.sortState && s.sortState.col === c
+            if (sorted || s.hoverCol === c) {
+                ctx.fillStyle = sorted ? COLORS.selection : '#9aa0a6'
+                ctx.fillText(sorted ? (s.sortState.dir === 'asc' ? '▲' : '▼') : '⇅', x + w - 14, COL_HEADER_HEIGHT / 2 + 1)
+            }
         }
         ctx.restore()
     }
@@ -247,7 +274,7 @@ function drawHeaders(ctx, s) {
 /**
  * Paint one frame.
  * @param {CanvasRenderingContext2D} ctx
- * @param {{ vp, engine, selection, editing, fillPreview }} s
+ * @param {{ vp, engine, selection, editing, fillPreview, filterButtons, sortState, hoverCol }} s
  */
 export function drawGrid(ctx, s) {
     const { vp } = s

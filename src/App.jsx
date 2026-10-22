@@ -4,6 +4,7 @@ import { createEngine } from './engine/core.js'
 import { cellAddress, parseRangeAddress, rangeAddress } from './engine/address.js'
 import { loadSampleSmall, loadSampleLarge, parseTsv } from './fixtures/loadSample.js'
 import { Grid } from './ui/Grid.jsx'
+import { FilterMenu } from './ui/FilterMenu.jsx'
 import { StatusBar } from './ui/StatusBar.jsx'
 import { Toolbar } from './ui/Toolbar.jsx'
 import { cellSelection, isMultiCell, makeSelection, rangeSelection } from './ui/selection.js'
@@ -19,6 +20,8 @@ export default function App() {
     const version = useSyncExternalStore(engine.subscribe, () => engine.version)
     const [selection, setSelection] = useState(() => cellSelection(0, 0))
     const [editing, setEditing] = useState(null)
+    const [filterMode, setFilterMode] = useState(false)
+    const [filterMenu, setFilterMenu] = useState(null)
     const gridRef = useRef(null)
     const editorRef = useRef(null)
     const barRef = useRef(null)
@@ -152,6 +155,11 @@ export default function App() {
         if (used) select(rangeSelection(used))
     }
 
+    function sortColumn(c) {
+        const sel = isMultiCell(selection) && selection.kind === 'cells' ? selectionRange() : null
+        timed('sort', () => engine.sortByColumn(c, sel))
+    }
+
     function undo() { if (editing) return; timed('undo', () => engine.undo()) }
     function redo() { if (editing) return; timed('redo', () => engine.redo()) }
 
@@ -233,6 +241,7 @@ export default function App() {
         if (editing) return
         const rows = []
         for (let r = selection.r1; r <= Math.min(selection.r2, selection.r1 + 10000); r++) {
+            if (engine.isRowHidden(r)) continue
             const row = []
             for (let c = selection.c1; c <= selection.c2; c++) row.push(engine.getCell(r, c).raw)
             rows.push(row.join('\t'))
@@ -275,6 +284,16 @@ export default function App() {
 
     // ── Derived view state ──
 
+    const table = engine.getTableRange()
+    const filterStatus = engine.getFilterStatus()
+    const showFilters = (filterMode || filterStatus.active) && table
+    const filterButtons = showFilters
+        ? {
+            lastCol: table.c2,
+            active: new Set(Array.from({ length: table.c2 + 1 }, (_, c) => c).filter(c => engine.getFilter(c))),
+        }
+        : null
+
     const selectionLabel = isMultiCell(selection) ? rangeAddress(selection) : cellAddress(active.r, active.c)
     const activeRaw = engine.getCell(active.r, active.c).raw
 
@@ -291,6 +310,9 @@ export default function App() {
                 onInsertColumn={insertColumns}
                 onDeleteColumn={deleteColumns}
                 onClear={clearSelection}
+                filterMode={filterMode}
+                onToggleFilters={() => setFilterMode(m => !m)}
+                onClearFilters={() => engine.clearFilters()}
                 onLoadSmall={() => loadSample(loadSampleSmall, 'load sales.tsv')}
                 onLoadLarge={() => loadSample(loadSampleLarge, 'load sales-large.tsv')}
             />
@@ -332,11 +354,23 @@ export default function App() {
                     onEditorKeyDown={onEditorKeyDown}
                     onEditorInput={onEditorInput}
                     onStartEdit={(r, c) => startEdit(r, c)}
+                    filterButtons={filterButtons}
+                    onOpenFilter={(col, anchor) => setFilterMenu({ col, anchor })}
+                    onSort={sortColumn}
                 />
             </div>
 
-            <StatusBar engine={engine} version={version} selection={selection} />
+            <StatusBar engine={engine} version={version} selection={selection} filterStatus={filterStatus} onClearFilters={() => engine.clearFilters()} />
 
+            {filterMenu && (
+                <FilterMenu
+                    key={filterMenu.col}
+                    engine={engine}
+                    col={filterMenu.col}
+                    anchor={filterMenu.anchor}
+                    onClose={() => { setFilterMenu(null); gridRef.current?.focus() }}
+                />
+            )}
         </div>
     )
 }

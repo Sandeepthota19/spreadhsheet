@@ -19,9 +19,10 @@
 
 import { cellAddress, columnLabel, normaliseRange, rangeAddress } from './address.js'
 import { parseFormula, evaluateTemplate, formatNumber, isError, ERR } from './formula.js'
-import { toNum } from './values.js'
+import { toNum, norm, looksLikeTotalsRow } from './values.js'
 import { createIdentityAxis } from './identity.js'
 import { makeSeries } from './fill.js'
+import { sortKey, compareKeys, EMPTY_ROW_KEY, compileFilter, isActiveFilter } from './sortFilter.js'
 import { DEFAULT_STYLE, mergeStyle, sameStyle, isDefaultStyle } from './style.js'
 
 export { DEFAULT_STYLE }
@@ -43,7 +44,7 @@ export function createEngine(initialRows = 50, initialCols = 50) {
     const styles = new Map()
     const colWidths = new Map()
     const rowHeights = new Map()
-    const view = { frozenRows: 0, frozenCols: 0 }
+    const view = { frozenRows: 0, frozenCols: 0, filters: new Map(), sort: null }
 
     // Dependency graph: single-cell references are indexed exactly;
     // formulas with ranges are checked for containment when a cell changes.
@@ -59,6 +60,7 @@ export function createEngine(initialRows = 50, initialCols = 50) {
     let version = 0
     const listeners = new Set()
     let usedCache = null
+    let hiddenCache = null
 
     // ── Keys and positions ──
 
@@ -264,6 +266,10 @@ export function createEngine(initialRows = 50, initialCols = 50) {
                 else axisOf(op.axis).insertIds(op.at, op.ids)
                 markStructural(op.axis, op.ids)
                 break
+            case 'permute':
+                axisOf(op.axis).place(op.positions, forward ? op.after : op.before)
+                markStructural(op.axis, null)
+                break
             case 'size': {
                 const map = op.axis === 'row' ? rowHeights : colWidths
                 const value = forward ? op.after : op.before
@@ -318,6 +324,12 @@ export function createEngine(initialRows = 50, initialCols = 50) {
         const ids = axisOf(axisName).remove(at, count)
         record({ t: 'delete', axis: axisName, at, ids })
         markStructural(axisName, ids)
+    }
+
+    function permuteRowsRecord(positions, before, after) {
+        record({ t: 'permute', axis: 'row', positions, before, after })
+        rowAxis.place(positions, after)
+        markStructural('row', null)
     }
 
     /**
@@ -548,6 +560,46 @@ export function createEngine(initialRows = 50, initialCols = 50) {
         return range
     }
 
+    function rowTexts(r, c1, c2) {
+        const out = []
+        for (let c = c1; c <= c2; c++) out.push(getText(r, c))
+        return out
+    }
+
+    /**
+     * The table that header-click sort and filters work on: the columns
+     * up to the last filled header cell in row 1, and the rows down to the
+     * last row with data in those columns. A stray value far away from the
+     * table does not stretch it. Falls back to the used range without a header.
+     */
+    let tableCache = null
+    function getTableRange() {
+        if (tableCache && tableCache.dataVersion === dataVersion) return tableCache.range
+        const used = getUsedRange()
+        let range = null
+        if (used) {
+            let c2 = -1
+            for (let c = 0; c <= used.c2; c++) if (getText(0, c) !== '') c2 = c
+            if (c2 < 0) c2 = used.c2
+            let r2 = 0
+            for (const key of cells.keys()) {
+                const r = rowAxis.posOf(rowIdOfKey(key))
+                const c = colAxis.posOf(colIdOfKey(key))
+                if (r > r2 && c >= 0 && c <= c2) r2 = r
+            }
+            range = { r1: 0, c1: 0, r2, c2 }
+        }
+        tableCache = { dataVersion, range }
+        return range
+    }
+
+    /** The table's last row if it reads as a totals row (contract §3.1 / §4.2), else -1. */
+    function totalsRowIndex() {
+        const table = getTableRange()
+        if (!table || table.r2 < 1) return -1
+        return looksLikeTotalsRow(rowTexts(table.r2, table.c1, table.c2)) ? table.r2 : -1
+    }
+
     /** Visit existing cells inside a range, choosing the cheaper strategy. */
     function forEachCellInRange(range, cb) {
         const area = (range.r2 - range.r1 + 1) * (range.c2 - range.c1 + 1)
@@ -712,6 +764,7 @@ export function createEngine(initialRows = 50, initialCols = 50) {
         if (at < 0 || at > rowAxis.length || count < 1) return
         transact(count === 1 ? `Insert row ${at + 1}` : `Insert ${count} rows`, () => {
             insertAxisRecord('row', at, count)
+            setViewRecord('sort', null)
         })
     }
 
@@ -728,6 +781,7 @@ export function createEngine(initialRows = 50, initialCols = 50) {
                 }
             }
             deleteAxisRecord('row', at, count)
+            setViewRecord('sort', null)
         })
     }
 
@@ -735,6 +789,7 @@ export function createEngine(initialRows = 50, initialCols = 50) {
         if (at < 0 || at > colAxis.length || count < 1) return
         transact(count === 1 ? `Insert column ${columnLabel(at)}` : `Insert ${count} columns`, () => {
             insertAxisRecord('col', at, count)
+            setViewRecord('sort', null)
         })
     }
 
@@ -747,7 +802,11 @@ export function createEngine(initialRows = 50, initialCols = 50) {
             for (let c = at; c < at + count; c++) doomed.add(colAxis.idAt(c))
             forEachCellInRange({ r1: 0, r2: rowAxis.length - 1, c1: at, c2: at + count - 1 }, (key) => setCellRecord(key, undefined))
             for (const key of [...styles.keys()]) if (doomed.has(colIdOfKey(key))) setStyleRecord(key, undefined)
+            if ([...view.filters.keys()].some(id => doomed.has(id))) {
+                setViewRecord('filters', new Map([...view.filters].filter(([id]) => !doomed.has(id))))
+            }
             deleteAxisRecord('col', at, count)
+            setViewRecord('sort', null)
         })
     }
 
@@ -787,6 +846,264 @@ export function createEngine(initialRows = 50, initialCols = 50) {
         })
     }
 
+    // ── Filters (a view: rows are hidden, never moved or changed) ──
+
+    /** Rows a filter applies to: the body below the header, minus a totals row. */
+    function filterBody() {
+        const table = getTableRange()
+        if (!table || table.r2 < 1) return null
+        const totals = totalsRowIndex()
+        return { r1: 1, r2: totals >= 0 ? totals - 1 : table.r2 }
+    }
+
+    function hiddenState() {
+        if (hiddenCache && hiddenCache.dataVersion === dataVersion && hiddenCache.filters === view.filters) return hiddenCache
+        const body = filterBody()
+        const hidden = new Uint8Array(rowAxis.length)
+        let total = 0
+        let visible = 0
+        const tests = []
+        for (const [colId, spec] of view.filters) {
+            const c = colAxis.posOf(colId)
+            if (c >= 0 && isActiveFilter(spec)) tests.push({ c, test: compileFilter(spec) })
+        }
+        if (body) {
+            for (let r = body.r1; r <= body.r2; r++) {
+                total++
+                for (const { c, test } of tests) {
+                    if (!test(getText(r, c))) { hidden[r] = 1; break }
+                }
+                if (!hidden[r]) visible++
+            }
+        }
+        hiddenCache = { dataVersion, filters: view.filters, hidden, total, visible, active: tests.length > 0 }
+        return hiddenCache
+    }
+
+    function isRowHidden(r) {
+        if (view.filters.size === 0) return false
+        return hiddenState().hidden[r] === 1
+    }
+
+    /** { visible, total, active } for the status line. */
+    function getFilterStatus() {
+        const s = hiddenState()
+        return { visible: s.visible, total: s.total, active: s.active }
+    }
+
+    function getFilter(c) {
+        return view.filters.get(colAxis.idAt(c)) || null
+    }
+
+    /** Set (or clear with null) the filter on column c. One undo step. */
+    function setFilter(c, spec) {
+        const colId = colAxis.idAt(c)
+        if (colId < 0) return
+        const next = new Map(view.filters)
+        if (spec && isActiveFilter(spec)) next.set(colId, { values: spec.values ? [...spec.values] : null, condition: spec.condition || null })
+        else next.delete(colId)
+        if (next.size === view.filters.size && !view.filters.has(colId) && !next.has(colId)) return
+        transact(spec ? `Filter ${columnLabel(c)}` : `Clear filter ${columnLabel(c)}`, () => setViewRecord('filters', next))
+    }
+
+    function clearFilters() {
+        if (view.filters.size === 0) return
+        transact('Clear all filters', () => setViewRecord('filters', new Map()))
+    }
+
+    /**
+     * Distinct values of column c over the filter body, grouped by the
+     * normalised text (so "West", "West " and "west" are one entry) with
+     * the first-seen label. '' is the (Blanks) entry.
+     */
+    function getFilterValues(c) {
+        const body = filterBody()
+        const groups = new Map()
+        if (body) {
+            for (let r = body.r1; r <= body.r2; r++) {
+                const text = getText(r, c)
+                const key = norm(text)
+                const g = groups.get(key)
+                if (g) g.count++
+                else groups.set(key, { key, label: key === '' ? '(Blanks)' : text.trim(), count: 1 })
+            }
+        }
+        return [...groups.values()].sort((a, b) => {
+            if (a.key === '') return 1
+            if (b.key === '') return -1
+            const na = toNum(a.label), nb = toNum(b.label)
+            if (na !== null && nb !== null) return na - nb
+            return a.key < b.key ? -1 : a.key > b.key ? 1 : 0
+        })
+    }
+
+    // ── Sort (a physical edit) ──
+
+    /**
+     * The block a header click sorts: a multi-row selection as-is, otherwise
+     * the used range below the header row with a trailing totals row pinned.
+     */
+    function sortBlockFor(selection) {
+        const table = getTableRange()
+        if (!table) return null
+        if (selection) {
+            const s = clampRange(selection)
+            const wholeRows = s.c1 === 0 && s.c2 === colAxis.length - 1
+            const wholeCols = s.r1 === 0 && s.r2 === rowAxis.length - 1
+            if (s.r2 > s.r1 && !wholeRows && !wholeCols) return { ...s, wholeRows: false }
+        }
+        const totals = totalsRowIndex()
+        const r2 = totals >= 0 ? totals - 1 : table.r2
+        if (r2 < 1) return null
+        return { r1: 1, r2, c1: table.c1, c2: table.c2, wholeRows: true }
+    }
+
+    // A row with no typed data. Formula cells don't count, so a blank row
+    // that a filled-down formula runs through still sorts to the bottom.
+    function rowIsEmpty(r, c1, c2) {
+        for (let c = c1; c <= c2; c++) {
+            const cell = cellAt(r, c)
+            if (cell && !cell.f) return false
+        }
+        return true
+    }
+
+    function sortedPositions(positions, block, col, dir) {
+        const keys = positions.map(r => {
+            if (rowIsEmpty(r, block.c1, block.c2)) return EMPTY_ROW_KEY
+            const cell = cellAt(r, col)
+            return sortKey(cell ? cell.v : null, cell ? isError(cell.v) : false)
+        })
+        const index = positions.map((_, i) => i)
+        index.sort((a, b) => compareKeys(keys[a], keys[b], dir) || a - b)
+        return index
+    }
+
+    // Ranges are positional: after rows are permuted, a range keeps covering
+    // the same positions (so =SUM(J2:J32) over the whole block is unchanged).
+    function rebindRangesAfterPermute(endpointPositions) {
+        for (const [key, refs] of endpointPositions) {
+            const cell = cells.get(key)
+            if (!cell?.f) continue
+            let changed = false
+            const next = cell.f.refs.map((ref, i) => {
+                const saved = refs[i]
+                if (!saved) return ref
+                const r1 = rowAxis.idAt(saved[0])
+                const r2 = rowAxis.idAt(saved[1])
+                if (r1 === ref.r1 && r2 === ref.r2) return ref
+                changed = true
+                return { ...ref, r1, r2 }
+            })
+            if (changed) setCellRecord(key, { raw: null, f: { tpl: cell.f.tpl, refs: next }, v: null })
+        }
+    }
+
+    function permuteRows(positions, nextIds) {
+        const before = rowAxis.idsAt(positions)
+        const endpointPositions = new Map()
+        for (const key of rangeFormulas) {
+            const refs = cells.get(key).f.refs.map(ref =>
+                ref.kind === 'range' ? [rowAxis.posOf(ref.r1), rowAxis.posOf(ref.r2)] : null)
+            endpointPositions.set(key, refs)
+        }
+        permuteRowsRecord(positions, before, nextIds)
+        rebindRangesAfterPermute(endpointPositions)
+    }
+
+    // A block narrower than the used range can't move whole rows, so its
+    // cells are moved instead (formulas shift like a copy).
+    function snapshotBlock(positions, block) {
+        return positions.map(r => {
+            const row = []
+            for (let c = block.c1; c <= block.c2; c++) {
+                const key = keyAt(r, c)
+                row.push({ cell: cells.get(key), style: styles.get(key), r })
+            }
+            return row
+        })
+    }
+
+    function writeBlock(positions, block, rowsInOrder) {
+        positions.forEach((r, i) => {
+            rowsInOrder[i].forEach((entry, j) => {
+                const key = keyAt(r, block.c1 + j)
+                setCellRecord(key, copyCell(entry.cell, r - entry.r, 0))
+                setStyleRecord(key, entry.style)
+            })
+        })
+    }
+
+    /**
+     * Sort a block by column `col` in direction 'asc' | 'desc' | 'none'
+     * ('none' restores the order saved when this sort cycle started).
+     * Only visible rows move; hidden rows keep their positions.
+     */
+    function sortBlock(block, col, dir) {
+        const colId = colAxis.idAt(col)
+        const positions = []
+        for (let r = block.r1; r <= block.r2; r++) if (!isRowHidden(r)) positions.push(r)
+        if (positions.length === 0) return
+        // Whole rows move (by identity) unless the block is a selection
+        // narrower than the used range; then only its cells are moved.
+        const used = getUsedRange()
+        const fullWidth = block.wholeRows || (block.c1 <= used.c1 && block.c2 >= used.c2)
+        const prev = view.sort
+        const sameCycle = prev && prev.colId === colId && prev.r1 === block.r1 && prev.r2 === block.r2 &&
+            prev.c1 === block.c1 && prev.c2 === block.c2 && prev.positions.join() === positions.join()
+        const original = sameCycle ? prev.original
+            : fullWidth ? rowAxis.idsAt(positions) : snapshotBlock(positions, block)
+
+        if (dir === 'none') {
+            if (fullWidth) permuteRows(positions, original)
+            else writeBlock(positions, block, original)
+            setViewRecord('sort', null)
+            return
+        }
+        const order = sortedPositions(positions, block, col, dir)
+        if (fullWidth) {
+            const ids = rowAxis.idsAt(positions)
+            permuteRows(positions, order.map(i => ids[i]))
+        } else {
+            const rows = snapshotBlock(positions, block)
+            writeBlock(positions, block, order.map(i => rows[i]))
+        }
+        setViewRecord('sort', { colId, dir, r1: block.r1, r2: block.r2, c1: block.c1, c2: block.c2, wholeRows: !!block.wholeRows, positions, original })
+    }
+
+    /**
+     * Header click: sort the block containing column `col` and cycle
+     * ascending → descending → original. Returns the new direction.
+     */
+    function sortByColumn(col, selection = null) {
+        let block = sortBlockFor(selection)
+        if (!block || col < block.c1 || col > block.c2) return null
+        const prev = view.sort
+        const colId = colAxis.idAt(col)
+        // Sorting can move empty rows to the bottom and so shrink the table;
+        // a repeated click on the same column keeps working on the same block.
+        const same = prev && prev.colId === colId && prev.r1 === block.r1 && prev.c1 === block.c1 &&
+            prev.c2 === block.c2 && (prev.r2 === block.r2 || (prev.wholeRows && block.wholeRows))
+        if (same) block = { ...block, r2: Math.max(prev.r2, block.r2) }
+        const dir = !same ? 'asc' : prev.dir === 'asc' ? 'desc' : 'none'
+        const label = { asc: 'ascending', desc: 'descending', none: 'original order' }[dir]
+        transact(`Sort by ${columnLabel(col)} ${label}`, () => sortBlock(block, col, dir))
+        return dir
+    }
+
+    /** Sort a block explicitly. One undo step. */
+    function sortRange(range, col, dir = 'asc') {
+        const block = clampRange(range)
+        transact(`Sort ${rangeAddress(block)}`, () => sortBlock(block, col, dir))
+    }
+
+    function getSortState() {
+        const s = view.sort
+        if (!s) return null
+        const col = colAxis.posOf(s.colId)
+        return col < 0 ? null : { col, dir: s.dir, r1: s.r1, r2: s.r2, c1: s.c1, c2: s.c2 }
+    }
+
     // ── Public API ──
 
     return {
@@ -805,6 +1122,8 @@ export function createEngine(initialRows = 50, initialCols = 50) {
         getDisplay,
         getStyle,
         getUsedRange,
+        getTableRange,
+        totalsRowIndex,
         // editing
         setCell,
         setCells,
@@ -827,6 +1146,16 @@ export function createEngine(initialRows = 50, initialCols = 50) {
         setColWidths,
         setRowHeights,
         setFreeze,
+        // filters and sort
+        isRowHidden,
+        getFilter,
+        setFilter,
+        clearFilters,
+        getFilterValues,
+        getFilterStatus,
+        sortByColumn,
+        sortRange,
+        getSortState,
         // history
         undo,
         redo,
