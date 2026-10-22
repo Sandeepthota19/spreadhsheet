@@ -1,5 +1,5 @@
 // Status line: filter status ("28 of 32 rows"), selection summary,
-// last undo step and action timings.
+// last undo step and live performance numbers.
 import { useSyncExternalStore } from 'react'
 import { perf } from './perf.js'
 import { toNum } from '../engine/values.js'
@@ -36,7 +36,7 @@ const subscribePerf = (l) => perf.subscribe(l)
 const perfSnapshot = () => {
     // a new object only when a recorded action changed, so React can bail out
     const s = perf.stats()
-    const key = JSON.stringify(s.actions)
+    const key = JSON.stringify(s.actions) + s.firstPaint
     if (!cached || cached.key !== key) { cached = { key, actions: s.actions }; cachedVersion++ }
     return cachedVersion
 }
@@ -59,6 +59,9 @@ export function StatusBar({ engine, selection, filterStatus, onClearFilters }) {
             )}
             {engine.undoLabel() && <span className="status-dim">Last: {engine.undoLabel()}</span>}
             <span className="spacer" />
+            <span className="status-dim" title="First canvas paint measured from navigation start / from app start; average and worst canvas paint over the last 120 frames">
+                first paint {fmt(stats.firstPaint)} / {fmt(stats.firstPaintFromApp)} ms · frame {fmt(stats.avgFrame)} / {fmt(stats.maxFrame)} ms · commits {stats.commits}
+            </span>
             {actions.length > 0 && (
                 <span className="status-dim" title="Duration of the last run of each action">
                     {actions.map(([k, v]) => `${k} ${fmt(v)} ms`).join(' · ')}

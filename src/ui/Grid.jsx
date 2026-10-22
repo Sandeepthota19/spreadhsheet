@@ -5,11 +5,15 @@
 import { useEffect, useImperativeHandle, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { createAxisLayout } from '../grid/axisLayout.js'
 import { createViewport, ROW_HEADER_WIDTH, COL_HEADER_HEIGHT, FILTER_BUTTON } from '../grid/geometry.js'
-import { drawGrid } from '../grid/draw.js'
+import { drawGrid, measureText } from '../grid/draw.js'
 import { makeSelection, fillTarget } from './selection.js'
 import { perf } from './perf.js'
 
-export function Grid({ engine, version, selection, onSelect, editing, editorRef, onEditorKeyDown, onEditorInput,
+const MIN_COL_WIDTH = 30
+const MAX_COL_WIDTH = 600
+const MIN_ROW_HEIGHT = 16
+
+export function Grid({ engine, selection, onSelect, editing, editorRef, onEditorKeyDown, onEditorInput,
     onStartEdit, filterButtons, onOpenFilter, onSort, gridRef }) {
     const containerRef = useRef(null)
     const canvasRef = useRef(null)
@@ -20,14 +24,14 @@ export function Grid({ engine, version, selection, onSelect, editing, editorRef,
 
     const rowLayout = useMemo(
         () => createAxisLayout(engine.rows, r => (engine.isRowHidden(r) ? 0 : engine.getRowHeight(r))),
-        // version changes on every engine transaction (sizes, filters, structure)
+        // rebuilt only when sizes, structure or row visibility can have changed
         // eslint-disable-next-line react-hooks/exhaustive-deps
-        [engine, version],
+        [engine, engine.layoutVersion],
     )
     const colLayout = useMemo(
         () => createAxisLayout(engine.cols, c => engine.getColWidth(c)),
         // eslint-disable-next-line react-hooks/exhaustive-deps
-        [engine, version],
+        [engine, engine.layoutVersion],
     )
 
     // Everything paint() needs, refreshed every render so the imperative
@@ -73,9 +77,12 @@ export function Grid({ engine, version, selection, onSelect, editing, editorRef,
             filterButtons: s.filterButtons,
             sortState: s.engine.getSortState(),
             hoverCol: hoverRef.current.col,
+            resizeGuide: mode?.type === 'colResize' ? { axis: 'col', pos: mode.guide }
+                : mode?.type === 'rowResize' ? { axis: 'row', pos: mode.guide } : null,
         })
         positionEditor(vp)
         perf.recordFrame(performance.now() - t0)
+        perf.painted()
     }
 
     function schedulePaint() {
@@ -130,8 +137,14 @@ export function Grid({ engine, version, selection, onSelect, editing, editorRef,
             }
             schedulePaint()
         },
+        /** Visible body rows, for Page Up / Page Down. */
+        pageRows() {
+            const vp = viewport()
+            return Math.max(1, vp.bodyRows.last - vp.bodyRows.first - 2 * 2)
+        },
         rowLayout: () => stateRef.current.rowLayout,
         colLayout: () => stateRef.current.colLayout,
+        autoFitColumn: (c) => autoFit(c),
     }))
 
     // ── Pointer handling ──
@@ -153,6 +166,21 @@ export function Grid({ engine, version, selection, onSelect, editing, editorRef,
         if (!sel || stateRef.current.editing) return false
         const rect = vp.rangeRect(sel)
         return Math.abs(x - (rect.x + rect.w)) <= 5 && Math.abs(y - (rect.y + rect.h)) <= 5
+    }
+
+    function autoFit(c) {
+        const ctx = canvasRef.current.getContext('2d')
+        const used = engine.getUsedRange()
+        let max = 0
+        if (used) {
+            for (let r = 0; r <= used.r2; r++) {
+                const text = engine.getDisplay(r, c)
+                if (text) max = Math.max(max, measureText(ctx, text, engine.getStyle(r, c)))
+            }
+        }
+        const filterPad = filterButtons ? FILTER_BUTTON + 4 : 0
+        const width = Math.max(MIN_COL_WIDTH, Math.min(MAX_COL_WIDTH, Math.ceil(max + 12 + filterPad)))
+        engine.setColWidths([{ c, width }], 'Auto-fit column')
     }
 
     function onPointerDown(e) {
@@ -203,6 +231,13 @@ export function Grid({ engine, version, selection, onSelect, editing, editorRef,
             case 'corner':
                 onSelect(makeSelection({ r: 0, c: 0 }, { r: s.rowLayout.count - 1, c: s.colLayout.count - 1 }, 'all'))
                 return
+            case 'colResize':
+                if (e.detail >= 2) { autoFit(hit.c); return }
+                modeRef.current = { type: 'colResize', c: hit.c, startX: x, startSize: s.colLayout.sizeOf(hit.c), guide: x }
+                break
+            case 'rowResize':
+                modeRef.current = { type: 'rowResize', r: hit.r, startY: y, startSize: s.rowLayout.sizeOf(hit.r), guide: y }
+                break
             case 'sort':
                 onSort(hit.c)
                 return
@@ -223,6 +258,14 @@ export function Grid({ engine, version, selection, onSelect, editing, editorRef,
             onSelect(makeSelection({ r: mode.anchorRow, c: 0 }, { r: p.r, c: s.colLayout.count - 1 }, 'rows'))
         } else if (mode.type === 'fill') {
             mode.target = fillTarget(mode.source, p)
+            schedulePaint()
+        } else if (mode.type === 'colResize') {
+            mode.size = Math.max(MIN_COL_WIDTH, Math.min(MAX_COL_WIDTH, mode.startSize + x - mode.startX))
+            mode.guide = vp.colX(mode.c) + mode.size
+            schedulePaint()
+        } else if (mode.type === 'rowResize') {
+            mode.size = Math.max(MIN_ROW_HEIGHT, mode.startSize + y - mode.startY)
+            mode.guide = vp.rowY(mode.r) + mode.size
             schedulePaint()
         }
     }
@@ -262,7 +305,9 @@ export function Grid({ engine, version, selection, onSelect, editing, editorRef,
         if (onFillHandle(vp, x, y)) cursor = 'crosshair'
         else {
             const hit = vp.hitTest(x, y)
-            if (hit.area === 'sort') { cursor = 'pointer'; hoverCol = hit.c }
+            if (hit.area === 'colResize') cursor = 'col-resize'
+            else if (hit.area === 'rowResize') cursor = 'row-resize'
+            else if (hit.area === 'sort') { cursor = 'pointer'; hoverCol = hit.c }
             else if (hit.area === 'colHeader') { cursor = 'default'; hoverCol = hit.c }
             else if (hit.area === 'rowHeader' || hit.area === 'corner') cursor = 'default'
         }
@@ -284,6 +329,10 @@ export function Grid({ engine, version, selection, onSelect, editing, editorRef,
             engine.fill(mode.source, mode.target)
             perf.record('fill', performance.now() - t0)
             onSelect(makeSelection({ r: mode.target.r1, c: mode.target.c1 }, { r: mode.target.r2, c: mode.target.c2 }))
+        } else if (mode.type === 'colResize' && mode.size) {
+            engine.setColWidths([{ c: mode.c, width: mode.size }])
+        } else if (mode.type === 'rowResize' && mode.size) {
+            engine.setRowHeights([{ r: mode.r, height: mode.size }])
         }
         schedulePaint()
     }

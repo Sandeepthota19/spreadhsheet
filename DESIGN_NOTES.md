@@ -6,6 +6,7 @@ Graders read this before the code. It covers the data model, every engine method
 
 - **Challenge 1: range selection and fill handle.** The engine was rebuilt on stable row and column ids, and the grid was rebuilt as a virtualized canvas. Selection, editing, the fill handle, `$` references and one-step undo are done. Acceptance tests are in `src/engine/fill.test.js`.
 - **Challenge 2: sort and filter.** Sort is a physical edit: it permutes row ids. Filters are an undoable view that hides rows. Acceptance tests are in `src/engine/sort.test.js`.
+- **Challenge 3: virtualized grid at scale.** The grid is 100,000 × 200: one canvas, prefix sums with binary search, four frozen panes, column/row resize, auto-fit, name box, `Ctrl+Home/End`, `Page Up/Down`. The used range and the layout are updated incrementally, so an edit does no O(sheet) work.
 
 ## Data model
 
@@ -41,6 +42,13 @@ engine
   - single-cell references are found through an exact reverse index;
   - formulas with ranges are found by a containment check;
   - only the dirty formulas are evaluated, precedents first, using an iterative DFS. A 20,000-long chain does not overflow the stack, and cycles evaluate to `#CYCLE!`.
+- **The grid** (`src/grid`, no React) paints one canvas per frame:
+  - `axisLayout.js` builds a prefix-sum array of row heights and another of column widths. Hidden rows have height 0. `indexAt(px)` is a binary search.
+  - `geometry.js` turns scroll position and frozen panes into screen coordinates and hit tests.
+  - `draw.js` paints the corner, frozen-row, frozen-column and body panes, each clipped. Only the visible rows and columns are painted, plus 2 overscan.
+  
+  The scroll container holds a spacer the size of the whole sheet, with the canvas `position: sticky` inside it. Scrolling repaints in `requestAnimationFrame` without a React render.
+- **Incremental bookkeeping.** The used range and the table range are cached. Adding a cell can only grow them, so they are updated in place; a removal or a structural change drops the cache. `engine.layoutVersion` changes only when sizes, structure or row visibility can change, and the grid rebuilds its 100,000-entry prefix sums only then. Committing an edit with 130,000 filled cells therefore costs about 2–5 ms from Enter to the canvas showing the value.
 - **No React state per cell.** React holds the engine's version number (`useSyncExternalStore`), the selection, the open editor and open menus. The canvas reads the engine directly.
 
 ## Engine API
@@ -73,6 +81,7 @@ Positions are 0-based. Every mutating method is one transaction, which is one un
 | `clearFilters()` | remove every filter | all filters at once |
 | `getFilter(c)`, `getFilterValues(c)` | current spec; distinct values grouped by normalised text, with first-seen label and count, (Blanks) last | – |
 | `isRowHidden(r)`, `getFilterStatus()` | visibility, and `{ visible, total, active }` for the status line | – |
+| `layoutVersion` | changes when row/column geometry may have changed (sizes, structure, filters, freeze) | – |
 | `transact(label, fn)` | run several mutations as one undo step | everything inside |
 | `undo()`, `redo()`, `canUndo()`, `canRedo()`, `undoLabel()`, `redoLabel()` | history | – |
 | `subscribe(fn)`, `version` | change notification for the UI | – |
@@ -112,6 +121,8 @@ Every user action is one engine transaction. A transaction records ops that can 
 | Load sample | the whole load |
 | Sort (header click or the ⇅ icon) | the new order, including rebound ranges and the sort-cycle state |
 | Apply or clear a column filter, or Clear all filters | that filter change (filters are part of history, so "undo twice" after filter + sort gives original order and no filter) |
+| Drag a column or row border; double-click a column border (auto-fit) | that one size change |
+| Freeze row 1 / column A | the freeze change |
 | Insert / delete row or column | the structural change, including the cells, styles and formulas it removed |
 
 ## Defects found in the existing code
@@ -139,6 +150,17 @@ Every user action is one engine transaction. A transaction records ops that can 
 | Same, cold, in Node | 21–58 ms | `src/engine/fill.test.js` ("fills 5,000 formula cells"), vitest, first run in a fresh process. |
 | Sort `sales-large.tsv` (2,990 data rows) by Date | **2.1 ms** median of 5 (first 3.6 ms) | Load "Sample 3k", click the ⇅ zone of the B header, read the status bar, undo, repeat. |
 | Sort 10,000 rows < 300 ms | **6.8 ms** median of 5 (first 7.8 ms); full cycle desc 8.3 / original 0.5 / asc 7.4 ms | Paste 10,000 data rows (sales-large rows repeated) as tab-separated text, then the same click/undo loop. In Node: 30–42 ms cold (`sort.test.js`). |
+| First paint < 100 ms | **21–25 ms** from navigation start (11–13 ms from app start), warm; the first cold load in a fresh browser was 98–152 ms | `performance.now()` at the first canvas paint, from navigation start, and minus a mark taken when `main.jsx` starts. 5 loads of `vite preview`. The 250 KB `sales-large` fixture is loaded on demand so it is not in the startup bundle. |
+| Scrolling at 60 fps | **60 fps**: 120 frames in 2 s; frame interval p50 16.7 ms, p95 16.8 ms, max 16.8 ms; canvas paint 0.6 ms average, 1.8 ms worst | At row 95,000 with `sales-large` loaded and K2:K100000 filled (about 130,000 filled cells). `scrollTop += 37` every 8 ms while a rAF loop records frame timestamps. |
+| Keystroke latency < 16 ms with 50,000+ filled cells | **0.5–8.5 ms** from keydown (`event.timeStamp`) to the next frame; 1 commit to open the editor, 0 per character, 2 on Enter | Same sheet. Typing `12345.67` into J95000. |
+| Commit an edit | engine 0.4–0.6 ms; Enter → painted 1.6–5 ms | status bar "edit" and "edit → paint". Before the incremental used range and `layoutVersion` this was 13 ms. |
+| Fill K2:K100000 with `=J2*2` | **83–94 ms** for 99,999 formula cells, including recalculation | status bar "fill". |
+
+### Challenge 3: how the acceptance checks are run
+
+- **Fill K2 = `=J2*2` to row 100,000.** Load "Sample 3k". Type `=J2*2` into K2. Type `K2:K100000` into the name box and press Enter. Press `Ctrl+D`. That fills 99,999 formula cells in one undo step.
+- **Row 95,000.** Type `J95000` in the name box, then type a value and press Enter. The status bar shows the React commit count (app-shell commits, counted in an effect), the engine time of the edit, "edit → paint" and canvas frame times. The devtools Performance panel shows the same: typing creates no React commit, because the cell editor and formula bar are uncontrolled inputs mirrored through refs. Starting the edit is 1 commit and Enter is 2.
+- **Freeze, resize, insert.** "❄ Row 1" freezes row 1. Drag D's header border to 300 px. Select column D and click "+ Col". The new D has the default 100 px and the old D, now E, keeps 300 px, because widths are keyed by column id. `structure.test.js` covers the same.
 
 ## Trade-offs and what you would do next
 
