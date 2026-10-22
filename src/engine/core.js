@@ -59,7 +59,13 @@ export function createEngine(initialRows = 50, initialCols = 50) {
     let dataVersion = 0
     let version = 0
     const listeners = new Set()
+    // Used range and table range are cached and kept current incrementally
+    // (adding a cell can only grow them); removals and structure changes
+    // drop the cache. layoutVersion changes only when row/column geometry
+    // can change, so the grid rebuilds its prefix sums only then.
     let usedCache = null
+    let tableCache = null
+    let layoutVersion = 0
     let hiddenCache = null
 
     // ── Keys and positions ──
@@ -217,8 +223,26 @@ export function createEngine(initialRows = 50, initialCols = 50) {
 
     // ── Primitive writes (apply only; recording is done by the callers) ──
 
+    function noteExtent(key, had, has) {
+        if (had === has) return
+        if (!has) { usedCache = null; tableCache = null; return }
+        const r = rowAxis.posOf(rowIdOfKey(key))
+        const c = colAxis.posOf(colIdOfKey(key))
+        if (r < 0 || c < 0) return
+        if (usedCache) {
+            const u = usedCache.range
+            usedCache = { range: u ? { r1: 0, c1: 0, r2: Math.max(u.r2, r), c2: Math.max(u.c2, c) } : { r1: 0, c1: 0, r2: r, c2: c } }
+        }
+        if (tableCache) {
+            const t = tableCache.range
+            if (!t || r === 0) tableCache = null
+            else if (c <= t.c2 && r > t.r2) tableCache = { range: { ...t, r2: r } }
+        }
+    }
+
     function writeCell(key, cell) {
         const old = cells.get(key)
+        noteExtent(key, !!old, !!cell)
         if (old?.f) unlink(key, old.f)
         if (cell) {
             cells.set(key, cell)
@@ -228,6 +252,7 @@ export function createEngine(initialRows = 50, initialCols = 50) {
         }
         pendingDirty.add(key)
         dataVersion++
+        if (view.filters.size > 0) layoutVersion++
     }
 
     function writeStyle(key, style) {
@@ -239,6 +264,9 @@ export function createEngine(initialRows = 50, initialCols = 50) {
         if (!structural) structural = { row: [], col: [] }
         if (ids) for (const id of ids) structural[axisName].push(id)
         dataVersion++
+        layoutVersion++
+        usedCache = null
+        tableCache = null
     }
 
     // ── Transactions and undo ──
@@ -271,6 +299,7 @@ export function createEngine(initialRows = 50, initialCols = 50) {
                 markStructural(op.axis, null)
                 break
             case 'size': {
+                layoutVersion++
                 const map = op.axis === 'row' ? rowHeights : colWidths
                 const value = forward ? op.after : op.before
                 if (value === undefined) map.delete(op.id)
@@ -279,6 +308,7 @@ export function createEngine(initialRows = 50, initialCols = 50) {
             }
             case 'view':
                 view[op.field] = forward ? op.after : op.before
+                layoutVersion++
                 break
         }
     }
@@ -303,6 +333,7 @@ export function createEngine(initialRows = 50, initialCols = 50) {
         const before = map.get(id)
         if (before === size) return
         record({ t: 'size', axis: axisName, id, before, after: size })
+        layoutVersion++
         if (size === undefined) map.delete(id)
         else map.set(id, size)
     }
@@ -312,6 +343,7 @@ export function createEngine(initialRows = 50, initialCols = 50) {
         if (before === value) return
         record({ t: 'view', field, before, after: value })
         view[field] = value
+        layoutVersion++
     }
 
     function insertAxisRecord(axisName, at, count) {
@@ -544,7 +576,7 @@ export function createEngine(initialRows = 50, initialCols = 50) {
 
     /** Bounding box of non-empty cells as { r1: 0, c1: 0, r2, c2 }, or null for an empty sheet. */
     function getUsedRange() {
-        if (usedCache && usedCache.dataVersion === dataVersion) return usedCache.range
+        if (usedCache) return usedCache.range
         let maxR = -1
         let maxC = -1
         for (const key of cells.keys()) {
@@ -556,7 +588,7 @@ export function createEngine(initialRows = 50, initialCols = 50) {
             if (c > maxC) maxC = c
         }
         const range = maxR < 0 ? null : { r1: 0, c1: 0, r2: maxR, c2: maxC }
-        usedCache = { dataVersion, range }
+        usedCache = { range }
         return range
     }
 
@@ -572,9 +604,8 @@ export function createEngine(initialRows = 50, initialCols = 50) {
      * last row with data in those columns. A stray value far away from the
      * table does not stretch it. Falls back to the used range without a header.
      */
-    let tableCache = null
     function getTableRange() {
-        if (tableCache && tableCache.dataVersion === dataVersion) return tableCache.range
+        if (tableCache) return tableCache.range
         const used = getUsedRange()
         let range = null
         if (used) {
@@ -589,7 +620,7 @@ export function createEngine(initialRows = 50, initialCols = 50) {
             }
             range = { r1: 0, c1: 0, r2, c2 }
         }
-        tableCache = { dataVersion, range }
+        tableCache = { range }
         return range
     }
 
@@ -641,6 +672,7 @@ export function createEngine(initialRows = 50, initialCols = 50) {
     function setCells(r0, c0, matrix, label = 'Paste') {
         const height = matrix.length
         const width = Math.max(0, ...matrix.map(row => row.length))
+        if (r0 + height > rowAxis.length || c0 + width > colAxis.length) layoutVersion++
         rowAxis.grow(r0 + height)
         colAxis.grow(c0 + width)
         return transact(label, () => {
@@ -1110,6 +1142,8 @@ export function createEngine(initialRows = 50, initialCols = 50) {
         get rows() { return rowAxis.length },
         get cols() { return colAxis.length },
         get version() { return version },
+        /** Changes whenever row/column sizes, order or visibility may have changed. */
+        get layoutVersion() { return layoutVersion },
         get frozenRows() { return view.frozenRows },
         get frozenCols() { return view.frozenCols },
         subscribe(listener) {
@@ -1168,6 +1202,7 @@ export function createEngine(initialRows = 50, initialCols = 50) {
         ensureCapacity(minRows, minCols) {
             rowAxis.grow(minRows)
             colAxis.grow(minCols)
+            layoutVersion++
             version++
             for (const listener of listeners) listener(version)
         },
