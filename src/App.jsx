@@ -10,8 +10,8 @@ import { Toolbar } from './ui/Toolbar.jsx'
 import { cellSelection, isMultiCell, makeSelection, rangeSelection } from './ui/selection.js'
 import { perf, timed } from './ui/perf.js'
 
-const TOTAL_ROWS = 1000
-const TOTAL_COLS = 52
+const TOTAL_ROWS = 100000
+const TOTAL_COLS = 200
 
 export default function App() {
     // The engine owns all sheet state. React only subscribes to its version
@@ -26,6 +26,9 @@ export default function App() {
     const editorRef = useRef(null)
     const barRef = useRef(null)
     const nameRef = useRef(null)
+
+    // Counts commits of the app shell, shown in the status bar.
+    useEffect(() => { perf.commit() })
 
     const active = selection.active
     const activeStyle = engine.getStyle(active.r, active.c)
@@ -91,6 +94,7 @@ export default function App() {
         const { r, c } = editing
         const value = currentEditValue()
         setEditing(null)
+        perf.untilPaint('edit → paint')
         timed('edit', () => engine.setCell(r, c, value))
         moveTo(r + dr, c + dc)
         gridRef.current?.focus()
@@ -209,7 +213,12 @@ export default function App() {
             else if (k === 'u') { handled(); applyStyle({ underline: !activeStyle.underline }) }
             else if (k === 'd') { handled(); fillDown() }
             else if (k === 'r') { handled(); fillRight() }
-            else if (key.startsWith('Arrow')) {
+            else if (key === 'Home') { handled(); moveTo(0, 0, e.shiftKey) }
+            else if (key === 'End') {
+                handled()
+                const used = engine.getUsedRange()
+                if (used) moveTo(used.r2, used.c2, e.shiftKey)
+            } else if (key.startsWith('Arrow')) {
                 handled()
                 const d = { ArrowDown: [1, 0], ArrowUp: [-1, 0], ArrowLeft: [0, -1], ArrowRight: [0, 1] }[key]
                 const to = jump(r, c, ...d)
@@ -222,6 +231,8 @@ export default function App() {
             case 'ArrowUp': handled(); moveTo(rowLayout.step(r, -1), c, e.shiftKey); break
             case 'ArrowRight': handled(); moveTo(r, colLayout.step(c, 1), e.shiftKey); break
             case 'ArrowLeft': handled(); moveTo(r, colLayout.step(c, -1), e.shiftKey); break
+            case 'PageDown': handled(); moveTo(r + gridRef.current.pageRows(), c, e.shiftKey); break
+            case 'PageUp': handled(); moveTo(r - gridRef.current.pageRows(), c, e.shiftKey); break
             case 'Home': handled(); moveTo(r, 0, e.shiftKey); break
             case 'Tab': handled(); moveTo(selection.active.r, colLayout.step(selection.active.c, e.shiftKey ? -1 : 1)); break
             case 'Enter':
@@ -313,6 +324,8 @@ export default function App() {
                 filterMode={filterMode}
                 onToggleFilters={() => setFilterMode(m => !m)}
                 onClearFilters={() => engine.clearFilters()}
+                onFreezeRow={() => engine.setFreeze({ rows: engine.frozenRows > 0 ? 0 : 1 })}
+                onFreezeCol={() => engine.setFreeze({ cols: engine.frozenCols > 0 ? 0 : 1 })}
                 onLoadSmall={() => loadSample(loadSampleSmall, 'load sales.tsv')}
                 onLoadLarge={() => loadSample(loadSampleLarge, 'load sales-large.tsv')}
             />
@@ -346,7 +359,6 @@ export default function App() {
                 <Grid
                     gridRef={gridRef}
                     engine={engine}
-                    version={version}
                     selection={selection}
                     onSelect={select}
                     editing={editing}
