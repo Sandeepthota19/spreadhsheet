@@ -7,6 +7,7 @@ Graders read this before the code. It covers the data model, every engine method
 - **Challenge 1: range selection and fill handle.** The engine was rebuilt on stable row and column ids, and the grid was rebuilt as a virtualized canvas. Selection, editing, the fill handle, `$` references and one-step undo are done. Acceptance tests are in `src/engine/fill.test.js`.
 - **Challenge 2: sort and filter.** Sort is a physical edit: it permutes row ids. Filters are an undoable view that hides rows. Acceptance tests are in `src/engine/sort.test.js`.
 - **Challenge 3: virtualized grid at scale.** The grid is 100,000 × 200: one canvas, prefix sums with binary search, four frozen panes, column/row resize, auto-fit, name box, `Ctrl+Home/End`, `Page Up/Down`. The used range and the layout are updated incrementally, so an edit does no O(sheet) work.
+- **Challenge 4: ask your data.** `Ctrl+K` opens a side panel. A prompt goes to the provider; the reply is parsed and validated, run by `executeQuery` over the sheet's computed values, and shown as a result card. All 20 golden queries match, in Node (`src/ai/queryExecutor.test.js`) and in the browser.
 
 ## Data model
 
@@ -81,6 +82,7 @@ Positions are 0-based. Every mutating method is one transaction, which is one un
 | `clearFilters()` | remove every filter | all filters at once |
 | `getFilter(c)`, `getFilterValues(c)` | current spec; distinct values grouped by normalised text, with first-seen label and count, (Blanks) last | – |
 | `isRowHidden(r)`, `getFilterStatus()` | visibility, and `{ visible, total, active }` for the status line | – |
+| `getTable()` | `{ header, rows }`: the used range as display text before number formats (row 1, then rows 2 to the last used row). This is the only data the AI code reads. | – |
 | `layoutVersion` | changes when row/column geometry may have changed (sizes, structure, filters, freeze) | – |
 | `transact(label, fn)` | run several mutations as one undo step | everything inside |
 | `undo()`, `redo()`, `canUndo()`, `canRedo()`, `undoLabel()`, `redoLabel()` | history | – |
@@ -121,6 +123,7 @@ Every user action is one engine transaction. A transaction records ops that can 
 | Load sample | the whole load |
 | Sort (header click or the ⇅ icon) | the new order, including rebound ranges and the sort-cycle state |
 | Apply or clear a column filter, or Clear all filters | that filter change (filters are part of history, so "undo twice" after filter + sort gives original order and no filter) |
+| Insert into sheet (query result card) | the whole inserted block (header + rows) |
 | Drag a column or row border; double-click a column border (auto-fit) | that one size change |
 | Freeze row 1 / column A | the freeze change |
 | Insert / delete row or column | the structural change, including the cells, styles and formulas it removed |
@@ -155,12 +158,80 @@ Every user action is one engine transaction. A transaction records ops that can 
 | Keystroke latency < 16 ms with 50,000+ filled cells | **0.5–8.5 ms** from keydown (`event.timeStamp`) to the next frame; 1 commit to open the editor, 0 per character, 2 on Enter | Same sheet. Typing `12345.67` into J95000. |
 | Commit an edit | engine 0.4–0.6 ms; Enter → painted 1.6–5 ms | status bar "edit" and "edit → paint". Before the incremental used range and `layoutVersion` this was 13 ms. |
 | Fill K2:K100000 with `=J2*2` | **83–94 ms** for 99,999 formula cells, including recalculation | status bar "fill". |
+| Any golden plan over `sales-large.tsv` < 50 ms | **2.6–7.9 ms**, median 5.2 ms. That includes `engine.getTable()`, i.e. reading 2,990 × 10 cells. | All 20 golden prompts typed into the panel in mock mode. The card's "computed in" time is `performance.now()` around `executeQuery(plan, engine.getTable())`. Node: 0–2.4 ms excluding table extraction. |
+| Two-level group-by over 100,000 rows < 500 ms | **151–164 ms** (3 runs), including extracting the 100,000-row table | Paste 100,000 data rows, then ask "Break down sales by region and category" (q11: group by Region, Category; sum Total). Node, 100,021 generated rows, executor only: 43–58 ms. |
 
 ### Challenge 3: how the acceptance checks are run
 
 - **Fill K2 = `=J2*2` to row 100,000.** Load "Sample 3k". Type `=J2*2` into K2. Type `K2:K100000` into the name box and press Enter. Press `Ctrl+D`. That fills 99,999 formula cells in one undo step.
 - **Row 95,000.** Type `J95000` in the name box, then type a value and press Enter. The status bar shows the React commit count (app-shell commits, counted in an effect), the engine time of the edit, "edit → paint" and canvas frame times. The devtools Performance panel shows the same: typing creates no React commit, because the cell editor and formula bar are uncontrolled inputs mirrored through refs. Starting the edit is 1 commit and Enter is 2.
 - **Freeze, resize, insert.** "❄ Row 1" freezes row 1. Drag D's header border to 300 px. Select column D and click "+ Col". The new D has the default 100 px and the old D, now E, keeps 300 px, because widths are keyed by column id. `structure.test.js` covers the same.
+
+## AI
+
+**Principle: the model translates, the engine computes.** Every number on a result card comes from `executeQuery` (`src/ai/queryExecutor.js`) run over `engine.getTable()`. The model's JSON is only a plan.
+
+### Modules (all pure, no React)
+
+| File | Role |
+|---|---|
+| `ai/provider.js` | Provider interface plus the http provider. It is the only file that knows wire formats: Anthropic Messages when the endpoint host is `anthropic.com`, OpenAI-compatible chat completions otherwise. Plain `fetch`. |
+| `ai/mockProvider.js` | Unchanged starter mock; answers the golden prompts. |
+| `ai/prompt.js` | System prompt: the task, the three JSON schemas, the rules, and the sheet context. |
+| `ai/runRequest.js` | One round trip: prompt → `provider.complete` → `parseModelResponse`. The UI only sees `{ ok, action }` or `{ ok:false, error, detail }`. |
+| `ai/extractJson.js` | Finds the first top-level JSON object in prose or code fences, with a string-aware brace matcher. |
+| `ai/validate.js` | Hand-written JSON-Schema subset (`type`, `const`, `enum`, `required`, `properties`, `additionalProperties:false`, `items`, `minimum`, `maximum`, `pattern`). `validateAction` gates on `type` first. |
+| `ai/queryExecutor.js` | AI_CONTRACT §3, exactly. |
+| `ai/context.js` | Builds the sheet context (below). |
+| `ai/describe.js` | Plain-words description of a plan, and the format preview. |
+
+### Context sent to the model (exact shape, for `sales.tsv` with C2:C10 selected)
+
+It goes in the system prompt. The `user` turn is the user's words only, because the mock matches the prompt verbatim; with a live model the effect is the same. History is the last 6 user/assistant turns. Rows: header plus five sample rows, never the data.
+
+```json
+{"range":"A1:J33","rowCount":30,
+ "columns":[{"name":"Order ID","index":0,"type":"id","examples":["ORD-1001","ORD-1002","ORD-1003"]},
+            {"name":"Date","index":1,"type":"date","examples":["2024-01-03","2024-01-05","1/8/2024"]},
+            {"name":"Region","index":2,"type":"text","examples":["North","West","East"]},
+            "… Sales Rep, Product, Category: text …",
+            {"name":"Units","index":6,"type":"number","examples":["4","12","6"]},
+            {"name":"Unit Price","index":7,"type":"currency","examples":["$1,200.00","$189.50","$320.00"]},
+            {"name":"Discount","index":8,"type":"percent","examples":["10%","5%","15%"]},
+            {"name":"Total","index":9,"type":"currency","examples":["$4,320.00","$2,160.30","$1,920.00"]}],
+ "sampleRows":[["ORD-1001","2024-01-03","North","Aarav Shah","Laptop Pro","Electronics","4","$1,200.00","10%","$4,320.00"], "… 4 more …"],
+ "selection":"C2:C10","hasTotalsRow":true}
+```
+
+`rowCount` counts data rows, excluding blank rows and the totals row. Column types are inferred from the body:
+- **id**: an id-like header, or unique `ABC-123` values;
+- **date**: at least 80% parse as dates;
+- **currency** / **percent**: at least 80% numeric and at least half carry `$` / `%`;
+- **number**: at least 80% numeric;
+- **text**: anything else.
+
+### Parsing, validation, failures
+
+| Failure | What the user sees | Sheet |
+|---|---|---|
+| Network / auth / rate limit / other HTTP / empty reply | Red card "The AI provider failed" with `PROVIDER_ERROR` and the provider code: `PROVIDER_NETWORK`, `PROVIDER_AUTH`, `PROVIDER_RATE_LIMIT` (with retry-after), `PROVIDER_HTTP` (status + body snippet), `PROVIDER_EMPTY`. Missing configuration gives `PROVIDER_CONFIG`. Never swallowed. | unchanged |
+| No JSON object / unparseable | `INVALID_RESPONSE` with the parse error; "Show model output" reveals the raw text | unchanged |
+| Valid JSON, schema fails | `INVALID_RESPONSE` listing every failing path, e.g. `$.limit: must be >= 1` | unchanged |
+| Action type not `query` / `format_sheet` / `clarify` (e.g. `mutation`) | `READ_ONLY` refusal | unchanged |
+| Unknown filter op or aggregate | `UNKNOWN_OP` / `UNKNOWN_FN` | unchanged |
+| Unknown column | "Which column did you mean?" with the offending name and the real headers. Nothing is guessed. | unchanged |
+| `clarify` | The model's question is shown | unchanged |
+
+`limit` is clamped to 500 in the executor, whatever the plan says. **Re-run** executes the stored plan again over the current sheet without calling the model. **Insert into sheet** writes header plus rows at the chosen cell (default: two columns right of the used range) in one undo step.
+
+### Golden set vs. contract
+
+- All 20 query cases match: columns exact, numbers within 0.01, order where the plan sorts, `rowsPreview`, `rowCount`, `truncated` and error codes.
+- **Judgement calls:**
+  - **Descending sort** negates the whole comparator, so non-numbers come before numbers in a descending row result. The contract's "numbers before non-numbers" is read as the ascending order. No golden case depends on this.
+  - **A sort on a row result** may name any source column.
+  - **`groupBy` with no aggregates** returns the distinct groups.
+  - **Aggregates are rounded to 2 decimals before sorting**, so the order matches what is shown.
 
 ## Trade-offs and what you would do next
 
