@@ -1,4 +1,5 @@
-// Status line: selection summary, last undo step and action timings.
+// Status line: filter status ("28 of 32 rows"), selection summary,
+// last undo step and action timings.
 import { useSyncExternalStore } from 'react'
 import { perf } from './perf.js'
 import { toNum } from '../engine/values.js'
@@ -15,6 +16,7 @@ function summarize(engine, sel) {
     if ((r2 - sel.r1 + 1) * (c2 - sel.c1 + 1) > MAX_SUMMARY_CELLS) return null
     let count = 0, numbers = 0, sum = 0
     for (let r = sel.r1; r <= r2; r++) {
+        if (engine.isRowHidden(r)) continue
         for (let c = sel.c1; c <= c2; c++) {
             const text = engine.getText(r, c)
             if (text === '') continue
@@ -39,13 +41,19 @@ const perfSnapshot = () => {
     return cachedVersion
 }
 
-export function StatusBar({ engine, selection }) {
+export function StatusBar({ engine, selection, filterStatus, onClearFilters }) {
     useSyncExternalStore(subscribePerf, perfSnapshot)
     const summary = summarize(engine, selection)
     const stats = perf.stats()
     const actions = Object.entries(stats.actions)
     return (
         <div className="status-bar">
+            {filterStatus.active && (
+                <span className="status-filter">
+                    {filterStatus.visible} of {filterStatus.total} rows
+                    <button type="button" onClick={onClearFilters}>clear</button>
+                </span>
+            )}
             {summary && (
                 <span>Count {summary.count}{summary.numbers > 0 && <> · Sum {Number(summary.sum.toFixed(2)).toLocaleString('en-US')}</>}</span>
             )}

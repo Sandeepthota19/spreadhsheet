@@ -7,6 +7,8 @@
 export const ROW_HEADER_WIDTH = 56
 export const COL_HEADER_HEIGHT = 24
 export const OVERSCAN = 2
+export const SORT_ZONE = 18
+export const FILTER_BUTTON = 16
 
 /**
  * @param {{ rowLayout, colLayout, frozenRows:number, frozenCols:number,
@@ -65,6 +67,8 @@ export function createViewport(p) {
         if (x < ROW_HEADER_WIDTH && y < COL_HEADER_HEIGHT) return { area: 'corner' }
         if (y < COL_HEADER_HEIGHT) {
             const c = colAtX(x)
+            const right = colX(c) + colLayout.sizeOf(c)
+            if (right - x <= SORT_ZONE) return { area: 'sort', c }
             return { area: 'colHeader', c }
         }
         if (x < ROW_HEADER_WIDTH) {

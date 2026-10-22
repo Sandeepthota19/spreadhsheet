@@ -7,7 +7,7 @@ const FILLS = [
 const SIZES = [8, 10, 11, 12, 13, 14, 16, 18, 20, 24]
 
 export function Toolbar({ engine, style, onStyle, onUndo, onRedo, onInsertRow, onDeleteRow, onInsertColumn, onDeleteColumn,
-    onClear, onLoadSmall, onLoadLarge, extra }) {
+    onClear, filterMode, onToggleFilters, onClearFilters, onLoadSmall, onLoadLarge, extra }) {
     const btn = (active) => `toolbar-btn ${active ? 'active' : ''}`
     return (
         <div className="toolbar" role="toolbar">
@@ -42,6 +42,10 @@ export function Toolbar({ engine, style, onStyle, onUndo, onRedo, onInsertRow, o
                 <button className="toolbar-btn" onClick={onInsertColumn} title="Insert column left">+ Col</button>
                 <button className="toolbar-btn" onClick={onDeleteColumn} title="Delete column">− Col</button>
                 <button className="toolbar-btn danger" onClick={onClear} title="Clear selection (Delete)">✕ Clear</button>
+            </div>
+            <div className="toolbar-group">
+                <button className={btn(filterMode)} onClick={onToggleFilters} title="Show filter buttons on the header row">⏷ Filter</button>
+                <button className="toolbar-btn" onClick={onClearFilters} disabled={!engine.getFilterStatus().active} title="Clear all filters">Clear filters</button>
             </div>
             <div className="toolbar-group">
                 <button className="toolbar-btn" onClick={onLoadSmall} title="Load fixtures/sales.tsv (33 rows) at A1">⬇ Sample 33</button>
