@@ -126,4 +126,16 @@ describe('structure', () => {
         expect(engine.getStyle(0, 0).italic).toBe(false)
     })
 
+    it('number formats change the display, never the stored value', () => {
+        const engine = createEngine(10, 10)
+        engine.setCells(0, 0, [['$1,200.00', '0.1', 'n/a', '15 Jan 2024']])
+        engine.setStyle({ r1: 0, c1: 0, r2: 0, c2: 0 }, { numberFormat: 'number' })
+        engine.setStyle({ r1: 0, c1: 1, r2: 0, c2: 2 }, { numberFormat: 'percent' })
+        engine.setStyle({ r1: 0, c1: 3, r2: 0, c2: 3 }, { numberFormat: 'date' })
+        expect(engine.getDisplay(0, 0)).toBe('1,200.00')
+        expect(engine.getDisplay(0, 1)).toBe('10%')
+        expect(engine.getDisplay(0, 2)).toBe('n/a')
+        expect(engine.getDisplay(0, 3)).toBe('2024-01-15')
+        expect(engine.getCell(0, 0).raw).toBe('$1,200.00')
+    })
 })

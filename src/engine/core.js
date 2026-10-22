@@ -23,6 +23,7 @@ import { toNum, norm, looksLikeTotalsRow } from './values.js'
 import { createIdentityAxis } from './identity.js'
 import { makeSeries } from './fill.js'
 import { sortKey, compareKeys, EMPTY_ROW_KEY, compileFilter, isActiveFilter } from './sortFilter.js'
+import { formatNumberDisplay } from './numberFormat.js'
 import { DEFAULT_STYLE, mergeStyle, sameStyle, isDefaultStyle } from './style.js'
 
 export { DEFAULT_STYLE }
@@ -571,7 +572,12 @@ export function createEngine(initialRows = 50, initialCols = 50) {
     }
 
     function getDisplay(r, c) {
-        return textOf(cellAt(r, c))
+        const cell = cellAt(r, c)
+        if (!cell) return ''
+        const text = textOf(cell)
+        const style = styles.get(keyAt(r, c))
+        if (!style || style.numberFormat === 'general' || isError(cell.v)) return text
+        return formatNumberDisplay(cell.f && typeof cell.v === 'number' ? cell.v : text, style.numberFormat)
     }
 
     /** Bounding box of non-empty cells as { r1: 0, c1: 0, r2, c2 }, or null for an empty sheet. */
@@ -1145,6 +1151,36 @@ export function createEngine(initialRows = 50, initialCols = 50) {
         return col < 0 ? null : { col, dir: s.dir, r1: s.r1, r2: s.r2, c1: s.c1, c2: s.c2 }
     }
 
+    // ── AI formatting ──
+
+    /** A read-only view of the used range in the shape the format planner expects. */
+    function getFormatSheet() {
+        const used = getUsedRange()
+        return {
+            rowCount: used ? used.r2 + 1 : 0,
+            colCount: used ? used.c2 + 1 : 0,
+            getStyle,
+            getText,
+            frozenRows: view.frozenRows,
+            getColWidth,
+        }
+    }
+
+    /**
+     * Apply a planned format (styles, widths, freeze) as ONE undo step.
+     * Returns false and records nothing when the plan changes nothing.
+     */
+    function applyFormat({ styles: styleList = [], widths = [], frozenRows }, label = 'AI format') {
+        let changed = false
+        transact(label, () => {
+            for (const { r, c, style } of styleList) setStyleRecord(keyAt(r, c), style)
+            for (const { c, width } of widths) setSizeRecord('col', colAxis.idAt(c), width)
+            if (frozenRows !== undefined && frozenRows !== null) setViewRecord('frozenRows', frozenRows)
+            changed = tx.ops.length > 0
+        })
+        return changed
+    }
+
     // ── Public API ──
 
     return {
@@ -1200,6 +1236,9 @@ export function createEngine(initialRows = 50, initialCols = 50) {
         sortByColumn,
         sortRange,
         getSortState,
+        // AI formatting
+        getFormatSheet,
+        applyFormat,
         // history
         undo,
         redo,
