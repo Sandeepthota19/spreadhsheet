@@ -631,6 +631,15 @@ export function createEngine(initialRows = 50, initialCols = 50) {
         return looksLikeTotalsRow(rowTexts(table.r2, table.c1, table.c2)) ? table.r2 : -1
     }
 
+    /** Header + body of the used range as display text (before number formats). */
+    function getTable() {
+        const used = getUsedRange()
+        if (!used) return { header: [], rows: [] }
+        const rows = []
+        for (let r = 1; r <= used.r2; r++) rows.push(rowTexts(r, used.c1, used.c2))
+        return { header: rowTexts(0, used.c1, used.c2), rows }
+    }
+
     /** Visit existing cells inside a range, choosing the cheaper strategy. */
     function forEachCellInRange(range, cb) {
         const area = (range.r2 - range.r1 + 1) * (range.c2 - range.c1 + 1)
@@ -1157,6 +1166,7 @@ export function createEngine(initialRows = 50, initialCols = 50) {
         getStyle,
         getUsedRange,
         getTableRange,
+        getTable,
         totalsRowIndex,
         // editing
         setCell,

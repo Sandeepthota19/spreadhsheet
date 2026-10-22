@@ -5,6 +5,8 @@ import { cellAddress, parseRangeAddress, rangeAddress } from './engine/address.j
 import { loadSampleSmall, loadSampleLarge, parseTsv } from './fixtures/loadSample.js'
 import { Grid } from './ui/Grid.jsx'
 import { FilterMenu } from './ui/FilterMenu.jsx'
+import { AiPanel } from './ui/AiPanel.jsx'
+import { createProvider } from './ai/provider.js'
 import { StatusBar } from './ui/StatusBar.jsx'
 import { Toolbar } from './ui/Toolbar.jsx'
 import { cellSelection, isMultiCell, makeSelection, rangeSelection } from './ui/selection.js'
@@ -22,10 +24,35 @@ export default function App() {
     const [editing, setEditing] = useState(null)
     const [filterMode, setFilterMode] = useState(false)
     const [filterMenu, setFilterMenu] = useState(null)
+    const [aiOpen, setAiOpen] = useState(false)
+    const [provider] = useState(() => createProvider())
     const gridRef = useRef(null)
     const editorRef = useRef(null)
     const barRef = useRef(null)
     const nameRef = useRef(null)
+
+    // App-wide shortcuts: Ctrl+K toggles the AI panel; Ctrl+Z / Ctrl+Y undo
+    // and redo from anywhere except a text field (which keeps its own undo).
+    useEffect(() => {
+        const onKey = (e) => {
+            if (!(e.metaKey || e.ctrlKey)) return
+            const k = e.key.toLowerCase()
+            if (k === 'k') {
+                e.preventDefault()
+                setAiOpen(open => !open)
+                return
+            }
+            const tag = e.target.tagName
+            if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return
+            if (k === 'z' || k === 'y') {
+                e.preventDefault()
+                const redoing = k === 'y' || e.shiftKey
+                timed(redoing ? 'redo' : 'undo', () => (redoing ? engine.redo() : engine.undo()))
+            }
+        }
+        window.addEventListener('keydown', onKey)
+        return () => window.removeEventListener('keydown', onKey)
+    }, [engine])
 
     // Counts commits of the app shell, shown in the status bar.
     useEffect(() => { perf.commit() })
@@ -205,9 +232,7 @@ export default function App() {
 
         if (ctrl) {
             const k = key.toLowerCase()
-            if (k === 'z') { handled(); if (e.shiftKey) redo(); else undo() }
-            else if (k === 'y') { handled(); redo() }
-            else if (k === 'a') { handled(); selectUsed() }
+            if (k === 'a') { handled(); selectUsed() }
             else if (k === 'b') { handled(); applyStyle({ bold: !activeStyle.bold }) }
             else if (k === 'i') { handled(); applyStyle({ italic: !activeStyle.italic }) }
             else if (k === 'u') { handled(); applyStyle({ underline: !activeStyle.underline }) }
@@ -328,6 +353,11 @@ export default function App() {
                 onFreezeCol={() => engine.setFreeze({ cols: engine.frozenCols > 0 ? 0 : 1 })}
                 onLoadSmall={() => loadSample(loadSampleSmall, 'load sales.tsv')}
                 onLoadLarge={() => loadSample(loadSampleLarge, 'load sales-large.tsv')}
+                extra={(
+                    <div className="toolbar-group">
+                        <button className={`toolbar-btn ${aiOpen ? 'active' : ''}`} onClick={() => setAiOpen(o => !o)} title="Ask your data (Ctrl+K)">✦ Ask AI</button>
+                    </div>
+                )}
             />
 
             <div className="formula-bar">
@@ -355,21 +385,32 @@ export default function App() {
                 />
             </div>
 
-            <div className="grid-host" onKeyDown={onGridKeyDown} onCopy={onCopy} onPaste={onPaste}>
-                <Grid
-                    gridRef={gridRef}
-                    engine={engine}
-                    selection={selection}
-                    onSelect={select}
-                    editing={editing}
-                    editorRef={editorRef}
-                    onEditorKeyDown={onEditorKeyDown}
-                    onEditorInput={onEditorInput}
-                    onStartEdit={(r, c) => startEdit(r, c)}
-                    filterButtons={filterButtons}
-                    onOpenFilter={(col, anchor) => setFilterMenu({ col, anchor })}
-                    onSort={sortColumn}
-                />
+            <div className="workspace">
+                <div className="grid-host" onKeyDown={onGridKeyDown} onCopy={onCopy} onPaste={onPaste}>
+                    <Grid
+                        gridRef={gridRef}
+                        engine={engine}
+                        selection={selection}
+                        onSelect={select}
+                        editing={editing}
+                        editorRef={editorRef}
+                        onEditorKeyDown={onEditorKeyDown}
+                        onEditorInput={onEditorInput}
+                        onStartEdit={(r, c) => startEdit(r, c)}
+                        filterButtons={filterButtons}
+                        onOpenFilter={(col, anchor) => setFilterMenu({ col, anchor })}
+                        onSort={sortColumn}
+                    />
+                </div>
+                {aiOpen && (
+                    <AiPanel
+                        engine={engine}
+                        provider={provider}
+                        selection={selection}
+                        onClose={() => { setAiOpen(false); gridRef.current?.focus() }}
+                        onSelectRange={range => { select(rangeSelection(range), true); gridRef.current?.focus() }}
+                    />
+                )}
             </div>
 
             <StatusBar engine={engine} version={version} selection={selection} filterStatus={filterStatus} onClearFilters={() => engine.clearFilters()} />
