@@ -7,6 +7,8 @@ import { executeQuery } from '../ai/queryExecutor.js'
 import { buildSheetContext } from '../ai/context.js'
 import { describeQuery } from '../ai/describe.js'
 import { cellAddress, parseCellAddress, rangeAddress } from '../engine/address.js'
+import { FormatCard } from './FormatCard.jsx'
+import { PlanToggle } from './PlanToggle.jsx'
 import { perf } from './perf.js'
 
 const HISTORY_TURNS = 6
@@ -15,6 +17,7 @@ const EXAMPLES = [
     'What is the total sales by region?',
     'Top 3 sales reps by total sales',
     'How many orders were placed in February 2024?',
+    'Format this as a clean table',
 ]
 
 let nextId = 1
@@ -120,17 +123,6 @@ export function AiPanel({ engine, provider, selection, onClose, onSelectRange })
     )
 }
 
-function PlanToggle({ m, update }) {
-    return (
-        <>
-            <button type="button" className="ai-link" onClick={() => update({ showPlan: !m.showPlan })}>
-                {m.showPlan ? 'Hide plan' : 'Show plan'}
-            </button>
-            {m.showPlan && <pre className="ai-plan">{JSON.stringify(m.action ?? null, null, 2)}</pre>}
-        </>
-    )
-}
-
 function AssistantCard({ m, engine, update, onSelectRange }) {
     if (m.kind === 'pending') return <div className="ai-card ai-pending">Thinking…</div>
     if (m.kind === 'error') {
@@ -157,14 +149,7 @@ function AssistantCard({ m, engine, update, onSelectRange }) {
             </div>
         )
     }
-    if (m.kind === 'format') {
-        return (
-            <div className="ai-card">
-                <div className="ai-card-title">Formatting actions are not supported yet</div>
-                <PlanToggle m={m} update={update} />
-            </div>
-        )
-    }
+    if (m.kind === 'format') return <FormatCard m={m} engine={engine} update={update} />
     return <QueryCard m={m} engine={engine} update={update} onSelectRange={onSelectRange} />
 }
 

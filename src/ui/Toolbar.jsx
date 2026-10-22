@@ -4,6 +4,7 @@ const FILLS = [
     ['white', 'White'], ['#ffff99', 'Yellow'], ['#99ffcc', 'Green'], ['#ffcccc', 'Red'],
     ['#cce5ff', 'Blue'], ['#e0ccff', 'Purple'], ['#ffd9b3', 'Orange'], ['#f0f0f0', 'Gray'],
 ]
+const FORMATS = [['general', 'General'], ['number', '1,200.00'], ['currency', '$1,200.00'], ['percent', '10%'], ['date', '2024-01-15']]
 const SIZES = [8, 10, 11, 12, 13, 14, 16, 18, 20, 24]
 
 export function Toolbar({ engine, style, onStyle, onUndo, onRedo, onInsertRow, onDeleteRow, onInsertColumn, onDeleteColumn,
@@ -34,6 +35,9 @@ export function Toolbar({ engine, style, onStyle, onUndo, onRedo, onInsertRow, o
                 <input type="color" className="toolbar-color" value={style.color} onChange={e => onStyle({ color: e.target.value })} title="Text colour" />
                 <select className="toolbar-select" value={style.bg} onChange={e => onStyle({ bg: e.target.value })} title="Fill colour">
                     {FILLS.map(([v, l]) => <option key={v} value={v}>{l}</option>)}
+                </select>
+                <select className="toolbar-select" value={style.numberFormat} onChange={e => onStyle({ numberFormat: e.target.value })} title="Number format">
+                    {FORMATS.map(([v, l]) => <option key={v} value={v}>{l}</option>)}
                 </select>
             </div>
             <div className="toolbar-group">
