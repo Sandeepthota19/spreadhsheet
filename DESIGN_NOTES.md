@@ -5,6 +5,7 @@ Graders read this before the code. It covers the data model, every engine method
 ## Challenges
 
 - **Challenge 1: range selection and fill handle.** The engine was rebuilt on stable row and column ids, and the grid was rebuilt as a virtualized canvas. Selection, editing, the fill handle, `$` references and one-step undo are done. Acceptance tests are in `src/engine/fill.test.js`.
+- **Challenge 2: sort and filter.** Sort is a physical edit: it permutes row ids. Filters are an undoable view that hides rows. Acceptance tests are in `src/engine/sort.test.js`.
 
 ## Data model
 
@@ -16,7 +17,7 @@ engine
 │     Formula = { tpl, refs }  tpl is shared (pieces + AST), refs are bound to ids
 ├── styles  Map<key, Style>  only non-default styles; Style is a frozen full object
 ├── colWidths Map<colId, px>, rowHeights Map<rowId, px>
-├── view    { frozenRows, frozenCols }
+├── view    { frozenRows, frozenCols, filters: Map<colId, FilterSpec>, sort: SortState|null }
 ├── dependents Map<key, Set<key>> + rangeFormulas Set<key>
 └── undoStack / redoStack: transactions of invertible ops
 ```
@@ -27,6 +28,14 @@ engine
   - an inserted column gets a new id, so it has the default width while the old D keeps 300 px;
   - a formula's text is rendered from the current positions of the ids it refers to. After inserting a row above row 10, `=$G$2*H32` renders as `=$G$2*H33` without being rewritten. A reference to a deleted row renders `#REF!`, and undo brings the id back.
 - **Formulas are parsed once.** `parseFormula` produces a template: the source split around its references, plus an AST whose reference nodes point into `refs` by index. A filled cell shares the seed's template and gets a new `refs` array, shifted for relative parts and unchanged for `$` parts. Filling 100,000 formula cells therefore never re-parses text.
+- **Sort moves rows by identity.** Sorting rewrites the id order of the sorted positions, nothing else, so:
+  - formulas, styles and row heights go with their rows;
+  - a single-cell reference follows its row (after sorting by Total, `K2 = J2/G2` belongs to ORD-1025 and shows 1080);
+  - ranges are positional, so before permuting the engine records where each range endpoint sits and rebinds it to the id now at that position. `=SUM(J2:J32)` is unchanged.
+
+  "Original order" is the id order saved when a sort cycle starts. That is the stable row identity the challenge asks for.
+- **Filters are a view.** A filter spec per column id lives in `view.filters`. Hidden rows are computed from the specs and cached against the data version. A hidden row gets height 0 in the grid's prefix sums, which produces the gaps in the row numbers. Formulas never look at visibility.
+- **The table.** Header-click sort and filters work on the table: the columns up to the last filled header cell in row 1, and the rows down to the last row with data in those columns. A trailing totals row (contract §3.1 / §4.2) is pinned: it is not sorted and not filtered. A stray value far away from the table therefore does not stretch the block.
 - **Values.** A literal cell keeps its raw text for display, and its value is read leniently (`values.js` `toNum`): `$1,200.00` is 1200, `10%` is 0.1, and `2024-01-15` stays text. So `=G2*H2` works on the messy sample data, while the grid still shows `$1,200.00`.
 - **Recalculation is incremental.** A change marks its transitive dependents dirty:
   - single-cell references are found through an exact reverse index;
@@ -56,6 +65,14 @@ Positions are 0-based. Every mutating method is one transaction, which is one un
 | `getColWidth(c)`, `getRowHeight(r)` | sizes (default 100 / 24) | – |
 | `setColWidths([{c,width}], label)`, `setRowHeights([{r,height}], label)` | resize | all sizes in the call |
 | `setFreeze({ rows, cols })`, `frozenRows`, `frozenCols` | frozen panes | the freeze change |
+| `sortByColumn(c, selection?)` | header click: sorts the selection if it is a multi-row cell range, otherwise the table body with a totals row pinned. Cycles asc → desc → original and returns the new direction. Only visible rows move. | the sort (order, rebound ranges, sort state) |
+| `sortRange(range, c, dir)` | sort an explicit block (`'asc' \| 'desc'`) | the sort |
+| `getSortState()` | `{ col, dir, r1, r2, c1, c2 }` or null | – |
+| `getTableRange()`, `totalsRowIndex()` | the table that sort and filters use, and its totals row (-1 if none) | – |
+| `setFilter(c, { values, condition })`, `setFilter(c, null)` | values: allowed normalised values (`''` = blanks) or null for all; condition: `{ op: contains\|gt\|lt\|isEmpty\|notEmpty, value }` | the filter change |
+| `clearFilters()` | remove every filter | all filters at once |
+| `getFilter(c)`, `getFilterValues(c)` | current spec; distinct values grouped by normalised text, with first-seen label and count, (Blanks) last | – |
+| `isRowHidden(r)`, `getFilterStatus()` | visibility, and `{ visible, total, active }` for the status line | – |
 | `transact(label, fn)` | run several mutations as one undo step | everything inside |
 | `undo()`, `redo()`, `canUndo()`, `canRedo()`, `undoLabel()`, `redoLabel()` | history | – |
 | `subscribe(fn)`, `version` | change notification for the UI | – |
@@ -73,6 +90,14 @@ Each line along the fill axis is filled from its own seeds. The value at offset 
 - **Anything else, or mixed seeds:** the seeds repeat.
 - **Style:** a filled cell takes the style of the seed it cycles from.
 
+### Sort and filter rules
+
+- **Comparison** (`sortFilter.js`). Numbers come first, read leniently, so `$4,320.00` is a number. Then dates, in any of the three shapes, compared as dates. Then text, compared case-insensitively. Then errors, then blank cells, and finally completely empty rows. Formula-only rows count as empty, so the blank row of `sales.tsv` sorts last even with `K = J/G` filled through it. Descending reverses the non-blank tiers. Blanks always stay last. Ties keep their order: a stable sort with an index tie-break.
+- **Filter values are grouped by `trim + lowercase`.** That's why "West", "West " and "west" are one checklist entry labelled "West", and a West filter shows all 8 such rows. That is the AI contract's normalisation, applied here too so the two features agree.
+- Several column filters combine with AND. Within one column, the value list and the condition must both hold.
+- **With a filter active, sort reorders only the visible rows**, among the visible positions. Hidden rows keep their place.
+- **A selection narrower than the used range** can't move whole rows. Its cells are moved instead, and formulas shift as if copied. References from outside into that block do not follow; this is a documented limit.
+
 ## Undo semantics
 
 Every user action is one engine transaction. A transaction records ops that can be applied in both directions: cell before/after, style before/after, axis insert/delete with the ids involved, size before/after, and view field before/after. Undo replays them in reverse, and redo replays them forward. Recalculation runs once at the end.
@@ -85,6 +110,8 @@ Every user action is one engine transaction. A transaction records ops that can 
 | Fill-handle drag, `Ctrl+D`, `Ctrl+R` | every filled cell (content and style), or every cell cleared by dragging back |
 | Paste (`Ctrl+V`, tab-separated) | the whole pasted block |
 | Load sample | the whole load |
+| Sort (header click or the ⇅ icon) | the new order, including rebound ranges and the sort-cycle state |
+| Apply or clear a column filter, or Clear all filters | that filter change (filters are part of history, so "undo twice" after filter + sort gives original order and no filter) |
 | Insert / delete row or column | the structural change, including the cells, styles and formulas it removed |
 
 ## Defects found in the existing code
@@ -110,10 +137,13 @@ Every user action is one engine transaction. A transaction records ops that can 
 |---|---|---|
 | Fill 5,000 cells < 200 ms | **median 2.2 ms**, worst 5.6 ms over 7 runs | Load `sales.tsv`, put `=J2/G2` in K2, type `A2:K456` in the name box, press `Ctrl+D` (11 × 454 = 4,994 cells: ids, dates, text, numbers and formulas), read the status bar, undo, repeat. |
 | Same, cold, in Node | 21–58 ms | `src/engine/fill.test.js` ("fills 5,000 formula cells"), vitest, first run in a fresh process. |
+| Sort `sales-large.tsv` (2,990 data rows) by Date | **2.1 ms** median of 5 (first 3.6 ms) | Load "Sample 3k", click the ⇅ zone of the B header, read the status bar, undo, repeat. |
+| Sort 10,000 rows < 300 ms | **6.8 ms** median of 5 (first 7.8 ms); full cycle desc 8.3 / original 0.5 / asc 7.4 ms | Paste 10,000 data rows (sales-large rows repeated) as tab-separated text, then the same click/undo loop. In Node: 30–42 ms cold (`sort.test.js`). |
 
 ## Trade-offs and what you would do next
 
 - **Range formulas** are found by a containment scan over all range formulas for each changed cell. That's fine for tens of thousands of range formulas, but a column of 100,000 cumulative `SUM`s would need an interval index per column.
+- **Filters re-evaluate on every data change** while active. Rows appear and disappear as you edit. Some spreadsheets only re-apply on request.
 - **Formula language:** `+ - * / ^ &`, unary minus, parentheses, strings, and `SUM AVERAGE/AVG MIN MAX COUNT ABS ROUND`. There are no comparison operators and no `IF`.
 
 ## Use of AI tools
