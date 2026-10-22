@@ -274,7 +274,7 @@ function drawHeaders(ctx, s) {
 /**
  * Paint one frame.
  * @param {CanvasRenderingContext2D} ctx
- * @param {{ vp, engine, selection, editing, fillPreview, filterButtons, sortState, hoverCol }} s
+ * @param {{ vp, engine, selection, editing, fillPreview, filterButtons, sortState, hoverCol, resizeGuide }} s
  */
 export function drawGrid(ctx, s) {
     const { vp } = s
@@ -301,4 +301,21 @@ export function drawGrid(ctx, s) {
     ctx.stroke()
     ctx.lineWidth = 1
     drawHeaders(ctx, s)
+    if (s.resizeGuide) {
+        ctx.strokeStyle = COLORS.selection
+        ctx.beginPath()
+        if (s.resizeGuide.axis === 'col') {
+            ctx.moveTo(s.resizeGuide.pos + 0.5, 0)
+            ctx.lineTo(s.resizeGuide.pos + 0.5, vp.height)
+        } else {
+            ctx.moveTo(0, s.resizeGuide.pos + 0.5)
+            ctx.lineTo(vp.width, s.resizeGuide.pos + 0.5)
+        }
+        ctx.stroke()
+    }
+}
+
+/** Text width in px for a style, for auto-fit. */
+export function measureText(ctx, text, style) {
+    return textWidth(ctx, fontFor(style), text)
 }

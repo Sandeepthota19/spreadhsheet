@@ -7,6 +7,7 @@
 export const ROW_HEADER_WIDTH = 56
 export const COL_HEADER_HEIGHT = 24
 export const OVERSCAN = 2
+export const RESIZE_GRIP = 4
 export const SORT_ZONE = 18
 export const FILTER_BUTTON = 16
 
@@ -62,17 +63,23 @@ export function createViewport(p) {
     /**
      * What is under the pointer.
      * area: 'corner' | 'colHeader' | 'rowHeader' | 'cell'
+     * plus resize hits on header borders.
      */
     function hitTest(x, y) {
         if (x < ROW_HEADER_WIDTH && y < COL_HEADER_HEIGHT) return { area: 'corner' }
         if (y < COL_HEADER_HEIGHT) {
             const c = colAtX(x)
             const right = colX(c) + colLayout.sizeOf(c)
+            const left = colX(c)
+            if (Math.abs(x - right) <= RESIZE_GRIP) return { area: 'colResize', c }
+            if (Math.abs(x - left) <= RESIZE_GRIP && c > 0) return { area: 'colResize', c: colLayout.step(c, -1) }
             if (right - x <= SORT_ZONE) return { area: 'sort', c }
             return { area: 'colHeader', c }
         }
         if (x < ROW_HEADER_WIDTH) {
             const r = rowAtY(y)
+            const bottom = rowY(r) + rowLayout.sizeOf(r)
+            if (Math.abs(y - bottom) <= RESIZE_GRIP) return { area: 'rowResize', r }
             return { area: 'rowHeader', r }
         }
         return { area: 'cell', r: rowAtY(y), c: colAtX(x) }
