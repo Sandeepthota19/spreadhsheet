@@ -8,6 +8,7 @@ Graders read this before the code. It covers the data model, every engine method
 - **Challenge 2: sort and filter.** Sort is a physical edit: it permutes row ids. Filters are an undoable view that hides rows. Acceptance tests are in `src/engine/sort.test.js`.
 - **Challenge 3: virtualized grid at scale.** The grid is 100,000 × 200: one canvas, prefix sums with binary search, four frozen panes, column/row resize, auto-fit, name box, `Ctrl+Home/End`, `Page Up/Down`. The used range and the layout are updated incrementally, so an edit does no O(sheet) work.
 - **Challenge 4: ask your data.** `Ctrl+K` opens a side panel. A prompt goes to the provider; the reply is parsed and validated, run by `executeQuery` over the sheet's computed values, and shown as a result card. All 20 golden queries match, in Node (`src/ai/queryExecutor.test.js`) and in the browser.
+- **Challenge 5: format with AI.** A `format_sheet` action is planned by a pure planner (`ai/formatPlan.js`) against the current sheet, previewed in plain words, and applied by `engine.applyFormat` as one undo step. Number formats are a display-only style. All 10 golden cases pass through the real engine (`src/ai/formatGolden.test.js`).
 
 ## Data model
 
@@ -60,7 +61,7 @@ Positions are 0-based. Every mutating method is one transaction, which is one un
 |---|---|---|
 | `getCell(r, c)` | `{ raw, computed, error }` (unchanged contract) | – |
 | `getText(r, c)` | what the grid shows before number formats | – |
-| `getDisplay(r, c)` | what the grid paints | – |
+| `getDisplay(r, c)` | what the grid paints: `getText`, plus the cell's `numberFormat` (display only, the stored value never changes) | – |
 | `getStyle(r, c)` | full style object (defaults filled in) | – |
 | `getUsedRange()` | bounding box of non-empty cells `{ r1:0, c1:0, r2, c2 }` or `null` | – |
 | `setCell(r, c, raw)` | edit one cell (no-op if unchanged) | that edit |
@@ -83,6 +84,8 @@ Positions are 0-based. Every mutating method is one transaction, which is one un
 | `getFilter(c)`, `getFilterValues(c)` | current spec; distinct values grouped by normalised text, with first-seen label and count, (Blanks) last | – |
 | `isRowHidden(r)`, `getFilterStatus()` | visibility, and `{ visible, total, active }` for the status line | – |
 | `getTable()` | `{ header, rows }`: the used range as display text before number formats (row 1, then rows 2 to the last used row). This is the only data the AI code reads. | – |
+| `getFormatSheet()` | read-only view for the format planner: `{ rowCount, colCount, getStyle, getText, frozenRows, getColWidth }` over the used range | – |
+| `applyFormat({ styles, widths, frozenRows }, label)` | apply a planned format. Returns `false` and records nothing when nothing changes. | every style, width and freeze change of the plan |
 | `layoutVersion` | changes when row/column geometry may have changed (sizes, structure, filters, freeze) | – |
 | `transact(label, fn)` | run several mutations as one undo step | everything inside |
 | `undo()`, `redo()`, `canUndo()`, `canRedo()`, `undoLabel()`, `redoLabel()` | history | – |
@@ -123,6 +126,7 @@ Every user action is one engine transaction. A transaction records ops that can 
 | Load sample | the whole load |
 | Sort (header click or the ⇅ icon) | the new order, including rebound ranges and the sort-cycle state |
 | Apply or clear a column filter, or Clear all filters | that filter change (filters are part of history, so "undo twice" after filter + sort gives original order and no filter) |
+| AI format → Apply | every style, column width and freeze change of that action. `NO_CHANGES` and `OUT_OF_RANGE` add no undo entry. |
 | Insert into sheet (query result card) | the whole inserted block (header + rows) |
 | Drag a column or row border; double-click a column border (auto-fit) | that one size change |
 | Freeze row 1 / column A | the freeze change |
@@ -159,6 +163,7 @@ Every user action is one engine transaction. A transaction records ops that can 
 | Commit an edit | engine 0.4–0.6 ms; Enter → painted 1.6–5 ms | status bar "edit" and "edit → paint". Before the incremental used range and `layoutVersion` this was 13 ms. |
 | Fill K2:K100000 with `=J2*2` | **83–94 ms** for 99,999 formula cells, including recalculation | status bar "fill". |
 | Any golden plan over `sales-large.tsv` < 50 ms | **2.6–7.9 ms**, median 5.2 ms. That includes `engine.getTable()`, i.e. reading 2,990 × 10 cells. | All 20 golden prompts typed into the panel in mock mode. The card's "computed in" time is `performance.now()` around `executeQuery(plan, engine.getTable())`. Node: 0–2.4 ms excluding table extraction. |
+| Format apply on `sales-large.tsv` < 300 ms | **29–30 ms** for f01 (3 runs; plan + apply; 29,920 cells; auto-fit measures every cell); 1.2 ms on `sales.tsv` | Card "Applied in": `performance.now()` around `planFormat` + `engine.applyFormat`. Node with a fake measurer: 64–110 ms. |
 | Two-level group-by over 100,000 rows < 500 ms | **151–164 ms** (3 runs), including extracting the 100,000-row table | Paste 100,000 data rows, then ask "Break down sales by region and category" (q11: group by Region, Category; sum Total). Node, 100,021 generated rows, executor only: 43–58 ms. |
 
 ### Challenge 3: how the acceptance checks are run
@@ -224,9 +229,37 @@ It goes in the system prompt. The `user` turn is the user's words only, because 
 
 `limit` is clamped to 500 in the executor, whatever the plan says. **Re-run** executes the stored plan again over the current sheet without calling the model. **Insert into sheet** writes header plus rows at the chosen cell (default: two columns right of the used range) in one undo step.
 
+### Formatting (`format_sheet`)
+
+- **Planning** (`ai/formatPlan.js`, pure) follows AI_CONTRACT §4:
+  - row 1 is the header, and the body runs to the last used row;
+  - the order is clear → body → columns → totals (only if the last row looks like a totals row) → header last;
+  - the header never gets a `numberFormat`;
+  - column indices outside the used range are ignored, and widths outside 30–600 are ignored;
+  - `freezeRows` ≥ used rows is `OUT_OF_RANGE`, and nothing else in the action is applied;
+  - auto-fit runs last and measures the formatted text with the canvas font (`grid/draw.js` `measureText`).
+
+  The plan is a diff of full styles against the current ones, so an action that changes nothing is `NO_CHANGES`.
+- **Applying** is `engine.applyFormat(plan)`: one transaction of style, size and view ops.
+- **The card** shows the description (for example "header: bold, grey, centred; 4 columns: right-aligned, number formats; freeze 1 row; totals row: bold; auto-fit columns") and a dry-run summary ("Will change 144 cell styles, 10 column widths, freeze 1 row"). Apply re-plans against the current sheet, so an edit between preview and Apply is respected. Discard does nothing.
+- **Number formats** (`engine/numberFormat.js`):
+
+  | Format | Display |
+  |---|---|
+  | `number` | `1,200.00` |
+  | `currency` | `$1,200.00` |
+  | `percent` | `0.1` and `10%` both show `10%` |
+  | `date` | any of the three shapes shows as `2024-01-15` |
+
+  Non-numeric text such as `n/a` is shown unchanged. The toolbar's format picker uses the same style property.
+- **Styles follow structure.** They are keyed by cell identity, so they move with insert/delete/sort, and undo restores them (`formatGolden.test.js`, "styles follow structure").
+
 ### Golden set vs. contract
 
 - All 20 query cases match: columns exact, numbers within 0.01, order where the plan sorts, `rowsPreview`, `rowCount`, `truncated` and error codes.
+- All 10 format cases pass through the engine, with one erratum. **f03** says `J22` displays `""`, but row 19 of `sales.tsv` is blank, so J22 is ORD-1020 (`$3,344.00`) and the blank Total is **J23** (ORD-1021). The test checks the intent ("blank stays blank") on J23.
+- **f04 and f06 on a sheet with no formatting** are `NO_CHANGES` with no undo entry, per rule 7. Each is also tested after a prior action: freeze then unfreeze, and f01 then f06, where each is one undo step.
+- **f08 on `sales-large.tsv`** (freeze 50 of 2,992 rows) is valid and applies; it is `OUT_OF_RANGE` only on the 33-row sheet.
 - **Judgement calls:**
   - **Descending sort** negates the whole comparator, so non-numbers come before numbers in a descending row result. The contract's "numbers before non-numbers" is read as the ascending order. No golden case depends on this.
   - **A sort on a row result** may name any source column.
@@ -234,6 +267,10 @@ It goes in the system prompt. The `user` turn is the user's words only, because 
   - **Aggregates are rounded to 2 decimals before sorting**, so the order matches what is shown.
 
 ## Trade-offs and what you would do next
+
+- **The API key is in the browser.** `VITE_*` variables are compiled into the bundle, so the http provider is for local use. Next step: a small `server/` proxy holding the key, which the provider would call instead; nothing else would change.
+- **Queries run on the main thread.** About 160 ms for 100,000 rows: noticeable, but the panel stays usable. For bigger sheets, run `executeQuery` in a Web Worker over a transferred table.
+- **Undo history is capped at 100 steps** and stores before/after records. A 100,000-cell fill keeps 100,000 small records alive until it falls off the stack.
 
 - **Range formulas** are found by a containment scan over all range formulas for each changed cell. That's fine for tens of thousands of range formulas, but a column of 100,000 cumulative `SUM`s would need an interval index per column.
 - **Filters re-evaluate on every data change** while active. Rows appear and disappear as you edit. Some spreadsheets only re-apply on request.
